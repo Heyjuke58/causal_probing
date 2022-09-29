@@ -2,3 +2,4 @@ torch
 pandas
 transformers
 scikit-learn
+ftfy
