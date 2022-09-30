@@ -1,6 +1,7 @@
 .vscode/
 assets/
 src/X*
+faiss_document_store.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

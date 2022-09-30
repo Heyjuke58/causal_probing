@@ -69,6 +69,7 @@ class MinimalExample:
                 p_embs[batch_size * i : batch_size * (i + 1), :] = p_emb
 
             # concat embeddings to get a tensor of len(query) x EMBEDDING_SIZE * 2
+            # maybe try other possibilities!
             X = torch.cat((q_embs, p_embs), 1)
 
             torch.save(X, X_file_str)
@@ -87,7 +88,8 @@ class MinimalExample:
         )
         return train, val, test
 
-    def rlace_linear_regression_closed_form(self, X: torch.Tensor, y: torch.Tensor):
+    @staticmethod
+    def rlace_linear_regression_closed_form(X: torch.Tensor, y: torch.Tensor):
         return torch.eye(X.shape[1], X.shape[1]) - (
             (X.t().mm(y)).mm(y.t().mm(X)) / ((y.t().mm(X)).mm(X.t().mm(y)))
         )
