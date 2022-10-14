@@ -2,6 +2,7 @@
 assets/
 src/X*
 faiss_document_store.db
+*.pickle
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

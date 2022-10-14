@@ -1,9 +1,14 @@
 from pathlib import Path
+import logging
 import torch
 import pandas as pd
 import numpy as np
+import pickle
+import math
+from typing import Optional
 from transformers import AutoTokenizer, AutoModel
 from haystack.document_stores.faiss import FAISSDocumentStore
+from haystack.nodes import EmbeddingRetriever
 from haystack.schema import Document
 
 from utils import get_corpus
@@ -13,7 +18,7 @@ from rlace import solve_adv_game
 
 DATASET_PATH = Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json")
 # MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
-MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection_sample.tsv")
+MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection_sample_100.tsv")
 SEED = 12
 batch_size = 3
 EMBEDDING_SIZE = 768
@@ -25,7 +30,8 @@ class MinimalExample:
     ) -> None:
         self.TASKS = {"bm25": self._bm25_probing_task}
         MODEL_CHOICES = {"tct_colbert": "castorini/tct_colbert-v2-hnp-msmarco"}
-        self.model_choice = MODEL_CHOICES[model_choice]
+        self.model_choice_hf_str = MODEL_CHOICES[model_choice]
+        self.model_choice = model_choice
         self.probing_task = probing_task
         self.dataset = pd.read_json(DATASET_PATH, orient="records")
 
@@ -33,10 +39,9 @@ class MinimalExample:
 
         # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = "cpu"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_choice)
-        self.model = AutoModel.from_pretrained(self.model_choice).to(self.device)
-        if reindex:
-            self.init_faiss_document_store()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_choice_hf_str)
+        self.model = AutoModel.from_pretrained(self.model_choice_hf_str).to(self.device)
+        self.document_store = self._init_faiss_document_store(reindex=reindex)
 
     def run(self):
         self.TASKS[self.probing_task]()
@@ -104,21 +109,59 @@ class MinimalExample:
         P = self.rlace_linear_regression_closed_form(X, y)
         return P
 
-    def init_faiss_document_store(self):
-        document_store = FAISSDocumentStore(faiss_index_factory_str="Flat")
-        corpus_df = get_corpus(MSMARCO_CORPUS_PATH)
-
-        def get_document(row) -> Document:
-            X_passage_tokenized = self.tokenizer(
-                row[1][1], padding=True, truncation=True, max_length=512, return_tensors="pt"
+    def _init_faiss_document_store(
+        self, projection: Optional[torch.Tensor] = None, reindex=False, batch_size=3
+    ):
+        index_name = f"{self.model_choice}{'_' + self.probing_task if projection else ''}"
+        if reindex:
+            document_store = FAISSDocumentStore(
+                faiss_index_factory_str="Flat", index=index_name, duplicate_documents="skip"
             )
-            emb = self.model(**X_passage_tokenized).pooler_output.detach().cpu() # eventuell '[D]' prependen?
-            doc = Document(content=row[1][1], embedding=emb, meta={"pid": row[1][0]})
-            return doc
-        # iterate over passages to index them
-        passages = [get_document(row) for row in corpus_df.iterrows()]
+            corpus_df = get_corpus(MSMARCO_CORPUS_PATH)
+            passages = corpus_df["passage"].tolist()
+            pids = corpus_df["pid"].tolist()
+            docs = []
 
-        document_store.write_documents(documents=passages)
+            batches = (
+                math.floor(len(corpus_df) / batch_size) + 1
+                if not (len(corpus_df) / batch_size).is_integer()
+                else int(len(corpus_df) / batch_size)
+            )
+
+            for i in range(batches):
+                logging.info(f"{i + 1} / {batches}")
+                X_passage_tokenized = self.tokenizer(
+                    passages[batch_size * i : min((batch_size * (i + 1)), len(corpus_df))],
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
+                ).to(self.device)
+                embs = (
+                    self.model(**X_passage_tokenized).pooler_output.detach().cpu()
+                )  # maybe prepend '[D]'?
+                for j in range(embs.shape[0]):
+                    # apply P to the embedding to remove a concept
+                    if projection:
+                        emb = embs[j, :].mm(projection)
+                    else:
+                        emb = embs[j, :]
+                    docs.append(Document(content=passages[i * batch_size + j], embedding=emb, meta={"pid": pids[i * batch_size + j]}))
+
+            document_store.write_documents(
+                documents=docs, duplicate_documents="skip", index=index_name, batch_size=300
+            )
+            with open(f"./{index_name}.pickle", "wb+") as faiss_index_file:
+                pickle.dump(document_store.faiss_indexes[index_name], faiss_index_file)
+        else:
+            with open(f"./{index_name}.pickle", "rb") as faiss_index_file:
+                faiss_index = pickle.load(faiss_index_file)
+                document_store = FAISSDocumentStore(
+                    faiss_index_factory_str="Flat",
+                    index=index_name,
+                    duplicate_documents="skip",
+                    faiss_index=faiss_index,
+                )
 
         return document_store
 
@@ -156,5 +199,6 @@ def main(args):
 
 
 if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.INFO)
     args = parse_arguments()
     main(args)
