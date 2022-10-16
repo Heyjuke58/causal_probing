@@ -50,9 +50,11 @@ class MinimalExample:
         # run probing task
         self.projection = self.TASKS[self.probing_task]()  # projection to remove a concept
         # init document store
-        self.document_store = self._init_faiss_document_store(
+        self.document_store = self._init_faiss_document_store_and_embeddings(
             reindex=reindex, batch_size=BATCH_SIZE
         )
+        # add index for embeddings after projection of probing task is applied
+        self._add_index_to_doc_store()
 
         self._evaluate_performance()
 
@@ -136,7 +138,7 @@ class MinimalExample:
         P = self.rlace_linear_regression_closed_form(X, y)
         return P
 
-    def _init_faiss_document_store(self, reindex=False, batch_size=3):
+    def _init_faiss_document_store_and_embeddings(self, reindex=False, batch_size=3):
         if reindex:
             document_store = FAISSDocumentStore(
                 faiss_index_factory_str="Flat", index=self.index_name, duplicate_documents="skip"
@@ -145,7 +147,6 @@ class MinimalExample:
             passages = corpus_df["passage"].tolist()
             pids = corpus_df["pid"].tolist()
             docs = []
-            docs_probing = []
 
             batches = (
                 math.floor(len(corpus_df) / batch_size) + 1
@@ -166,9 +167,6 @@ class MinimalExample:
                     self.model(**X_passage_tokenized).pooler_output.detach().cpu()
                 )  # maybe prepend '[D]'?
                 for j in range(embs.shape[0]):
-                    emb_probing = (
-                        embs[j, :].unsqueeze(0).mm(self.projection).squeeze(0)
-                    )  # apply P to the embedding to remove a concept
                     emb = embs[j, :]
                     docs.append(
                         Document(
@@ -177,27 +175,15 @@ class MinimalExample:
                             meta={"pid": pids[i * batch_size + j]},
                         )
                     )
-                    docs_probing.append(
-                        Document(
-                            content=passages[i * batch_size + j],
-                            embedding=emb_probing,
-                            meta={"pid": pids[i * batch_size + j]},
-                        )
-                    )
 
             document_store.write_documents(
                 documents=docs, duplicate_documents="skip", index=self.index_name, batch_size=300
             )
-            document_store.write_documents(
-                documents=docs_probing,
-                duplicate_documents="skip",
-                index=self.index_name_probing,
-                batch_size=300,
-            )
+            with open(f"./{self.index_name}_embs.pickle", "wb+") as docs_file:
+                pickle.dump(docs, docs_file)
             with open(f"./{self.index_name}.pickle", "wb+") as faiss_index_file:
                 pickle.dump(document_store.faiss_indexes[self.index_name], faiss_index_file)
-            with open(f"./{self.index_name_probing}.pickle", "wb+") as faiss_index_file:
-                pickle.dump(document_store.faiss_indexes[self.index_name_probing], faiss_index_file)
+
         else:
             document_store = None
             with open(f"./{self.index_name}.pickle", "rb") as faiss_index_file:
@@ -208,18 +194,19 @@ class MinimalExample:
                     duplicate_documents="skip",
                     faiss_index=faiss_index,
                 )
-            # check whether two indicies are possible in document store!
-            with open(f"./{self.index_name_probing}.pickle", "rb") as faiss_index_file:
-                faiss_index = pickle.load(faiss_index_file)
 
         return document_store
 
-    # def _add_index_to_doc_store(self, projection):
-    #     index_name = f"{self.model_choice}{'_' + self.probing_task if projection else ''}"
-
-    #     self.document_store.write_documents(
-    #         documents=docs, duplicate_documents="skip", index=index_name, batch_size=300
-    #     )
+    def _add_index_to_doc_store(self):
+        with open(f"./{self.index_name}_embs.pickle", "rb") as docs_file:
+            docs: list[Document] = pickle.load(docs_file)
+        for doc in docs:
+            emb = torch.tensor(doc.embedding).unsqueeze(0)
+            doc.embedding = emb.mm(self.projection).squeeze(0).numpy()
+            pass
+        self.document_store.write_documents(
+            documents=docs, duplicate_documents="skip", index=self.index_name_probing, batch_size=300
+        )
 
     def _evaluate_performance(self):
         queries = get_queries(MSMARCO_TEST_QUERIES_PATH)
