@@ -17,12 +17,12 @@ from argument_parser import parse_arguments
 from rlace import solve_adv_game
 
 DATASET_PATH = Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json")
-# MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
-MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection_sample_100.tsv")
+MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
+# MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection_sample_100.tsv")
 MSMARCO_TEST_QUERIES_PATH = Path("./assets/msmarco/queries.dev.tsv")
 MSMARCO_TEST_QRELS_PATH = Path("./assets/msmarco/qrels.dev.tsv")
 SEED = 12
-BATCH_SIZE = 3
+BATCH_SIZE = 20
 EMBEDDING_SIZE = 768
 
 
@@ -43,15 +43,16 @@ class MinimalExample:
 
         self.train, self.val, self.test = self._train_val_test_split()
 
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = "cpu"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # init model
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_choice_hf_str)
         self.model = AutoModel.from_pretrained(self.model_choice_hf_str).to(self.device)
         # run probing task
         self.projection = self.TASKS[self.probing_task]()  # projection to remove a concept
         # init document store
-        self.document_store = self._init_faiss_document_store(reindex=reindex)
+        self.document_store = self._init_faiss_document_store(
+            reindex=reindex, batch_size=BATCH_SIZE
+        )
 
         self._evaluate_performance()
 
@@ -66,17 +67,23 @@ class MinimalExample:
             q_embs = torch.empty((len(X_query), EMBEDDING_SIZE))
             p_embs = torch.empty((len(X_passage), EMBEDDING_SIZE))
 
-            for i in range(int(len(X_query) / batch_size)):
-                print(f"{i} / {int(len(X_query) / batch_size)}")
+            batches = (
+                math.floor(len(X_query) / batch_size) + 1
+                if not (len(X_query) / batch_size).is_integer()
+                else int(len(X_query) / batch_size)
+            )
+
+            for i in range(batches):
+                print(f"{i} / {batches}")
                 X_query_tokenized = self.tokenizer(
-                    X_query.tolist()[batch_size * i : batch_size * (i + 1)],
+                    X_query.tolist()[batch_size * i : min(batch_size * (i + 1), len(X_query))],
                     padding=True,
                     truncation=True,
                     max_length=512,
                     return_tensors="pt",
                 ).to(self.device)
                 X_passage_tokenized = self.tokenizer(
-                    X_passage.tolist()[batch_size * i : batch_size * (i + 1)],
+                    X_passage.tolist()[batch_size * i : min(batch_size * (i + 1), len(X_query))],
                     padding=True,
                     truncation=True,
                     max_length=512,
@@ -84,8 +91,8 @@ class MinimalExample:
                 ).to(self.device)
                 q_emb = self.model(**X_query_tokenized).pooler_output.detach().cpu()
                 p_emb = self.model(**X_passage_tokenized).pooler_output.detach().cpu()
-                q_embs[batch_size * i : batch_size * (i + 1), :] = q_emb
-                p_embs[batch_size * i : batch_size * (i + 1), :] = p_emb
+                q_embs[batch_size * i : min(batch_size * (i + 1), len(X_query)), :] = q_emb
+                p_embs[batch_size * i : min(batch_size * (i + 1), len(X_query)), :] = p_emb
 
             # What needs to be done here?
             if merging == "concat":
@@ -122,7 +129,7 @@ class MinimalExample:
     def _bm25_probing_task(self):
         X_query = np.array([x["query"] for x in self.train["input"].values])
         X_passage = np.array([x["passage"] for x in self.train["input"].values])
-        X = self._get_X_probing_task(X_query, X_passage, 1, "multiply_elementwise")
+        X = self._get_X_probing_task(X_query, X_passage, BATCH_SIZE, "multiply_elementwise")
         y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())
         y = y.to(torch.float32).unsqueeze(1)
 
@@ -149,7 +156,7 @@ class MinimalExample:
             for i in range(batches):
                 logging.info(f"{i + 1} / {batches}")
                 X_passage_tokenized = self.tokenizer(
-                    passages[batch_size * i : min((batch_size * (i + 1)), len(corpus_df))],
+                    passages[batch_size * i : min(batch_size * (i + 1), len(corpus_df))],
                     padding=True,
                     truncation=True,
                     max_length=512,
@@ -240,7 +247,9 @@ class MinimalExample:
             q_emb = q_emb.squeeze(0).numpy()
             q_emb_probing = q_emb_probing.squeeze(0).numpy()
             relevant_docs = self.document_store.query_by_embedding(q_emb, index="tct_colbert")
-            relevant_docs_probing = self.document_store.query_by_embedding(q_emb_probing, index="tct_colbert")
+            relevant_docs_probing = self.document_store.query_by_embedding(
+                q_emb_probing, index="tct_colbert"
+            )
 
             # calculating MRR@10
             reciprocal_rank = 0
@@ -248,7 +257,8 @@ class MinimalExample:
             for j, (doc1, doc2) in enumerate(zip(relevant_docs, relevant_docs_probing)):
                 if (
                     doc1.meta["vector_id"] == relevant_pid
-                ):  # vectore_id is a counter which corresponds to pid
+                ):  # vectore_id is a counter which corresponds to pid,
+                    # however it would be better to have the meta data given the documents
                     reciprocal_rank = (j + 1) / len(relevant_docs)
                 if doc2.meta["vector_id"] == relevant_pid:
                     reciprocal_rank_probing = (j + 1) / len(relevant_docs)
@@ -257,6 +267,14 @@ class MinimalExample:
 
         mrr = np.mean(reciprocal_ranks)
         mrr_probing = np.mean(reciprocal_ranks_probing)
+
+        logging.info(
+            f"""   
+        Model/Probing Task    | MRR@10
+        {self.index_name}    | {mrr}
+        {self.index_name_probing}    | {mrr_probing}                    
+        """
+        )
 
         return mrr, mrr_probing
 

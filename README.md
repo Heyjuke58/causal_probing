@@ -16,3 +16,8 @@ cd haystack
 pip install --upgrade pip
 pip install -e '.[all-gpu]'
 ```
+
+Run minimal example
+```
+CUDA_VISIBLE_DEVICES=x,y python src/minimal_example.py
+```
