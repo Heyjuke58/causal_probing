@@ -11,10 +11,11 @@ from haystack.document_stores.faiss import FAISSDocumentStore
 from haystack.nodes import EmbeddingRetriever
 from haystack.schema import Document
 
-from utils import get_corpus, get_qrels, get_queries
-from argument_parser import parse_arguments
+from src.utils import get_corpus, get_qrels, get_queries
+from src.argument_parser import parse_arguments
 
-from rlace import solve_adv_game
+from src.elasticsearch_bm25 import ElasticSearchBM25
+from src.rlace import solve_adv_game
 
 DATASET_PATH = Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json")
 MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
@@ -50,7 +51,7 @@ class MinimalExample:
         # run probing task
         self.projection = self.TASKS[self.probing_task]()  # projection to remove a concept
         # init document store
-        self.document_store = self._init_faiss_document_store_and_embeddings(
+        self.document_store, self.es_bm25 = self._init_faiss_doc_store_and_es_bm25(
             reindex=reindex, batch_size=BATCH_SIZE
         )
         # add index for embeddings after projection of probing task is applied
@@ -138,12 +139,13 @@ class MinimalExample:
         P = self.rlace_linear_regression_closed_form(X, y)
         return P
 
-    def _init_faiss_document_store_and_embeddings(self, reindex=False, batch_size=3):
+    def _init_faiss_doc_store_and_es_bm25(self, reindex=False, batch_size=3):
         if reindex:
             document_store = FAISSDocumentStore(
                 faiss_index_factory_str="Flat", index=self.index_name, duplicate_documents="skip"
             )
             corpus_df = get_corpus(MSMARCO_CORPUS_PATH)
+            es_bm25 = self._init_elasticsearch_bm25_index(corpus_df["passage"].to_dict())
             passages = corpus_df["passage"].tolist()
             pids = corpus_df["pid"].tolist()
             docs = []
@@ -195,7 +197,7 @@ class MinimalExample:
                     faiss_index=faiss_index,
                 )
 
-        return document_store
+        return document_store, es_bm25
 
     def _add_index_to_doc_store(self):
         with open(f"./{self.index_name}_embs.pickle", "rb") as docs_file:
@@ -207,6 +209,20 @@ class MinimalExample:
         self.document_store.write_documents(
             documents=docs, duplicate_documents="skip", index=self.index_name_probing, batch_size=300
         )
+
+    def _init_elasticsearch_bm25_index(self, pool):
+        bm25 = ElasticSearchBM25(
+            pool,
+            index_name="msmarco3", # TODO: if more than msmarco should be used this has to be edited
+            service_type="docker",
+            max_waiting=100,
+            port_http="12375",
+            port_tcp="12376",
+            es_version="7.16.2",
+            reindexing=False,
+        )
+
+        return bm25
 
     def _evaluate_performance(self):
         queries = get_queries(MSMARCO_TEST_QUERIES_PATH)
