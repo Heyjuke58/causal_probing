@@ -1,3 +1,4 @@
+from collections import defaultdict
 from pathlib import Path
 import pandas as pd
 import logging
@@ -34,3 +35,14 @@ def get_qrels(path: Path) -> pd.DataFrame:
     logging.info("Qrels loaded.")
 
     return qrels_df
+
+def get_top_1000_passages(path: Path) -> dict[int, list[int]]:
+    # q_id -> [p_id1, p_id2, .. , p_id1000]
+    q_p_top1000_dict: dict[int, list[int]] = defaultdict(list)
+    with open(path, "r") as f:
+        for line in f:
+            q_id, p_id = tuple(line.split(sep="\t")[:2])
+            q_p_top1000_dict[int(q_id)].append(int(p_id))
+    logging.info("Top 1000 passages per query parsed.")
+
+    return q_p_top1000_dict

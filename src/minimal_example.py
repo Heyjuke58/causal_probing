@@ -11,8 +11,8 @@ from haystack.document_stores.faiss import FAISSDocumentStore
 from haystack.nodes import EmbeddingRetriever
 from haystack.schema import Document
 
-from src.utils import get_corpus, get_qrels, get_queries
-from src.argument_parser import parse_arguments
+from utils import get_corpus, get_qrels, get_queries, get_top_1000_passages
+from argument_parser import parse_arguments
 
 from src.elasticsearch_bm25 import ElasticSearchBM25
 from src.rlace import solve_adv_game
@@ -20,8 +20,9 @@ from src.rlace import solve_adv_game
 DATASET_PATH = Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json")
 MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
 # MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection_sample_100.tsv")
-MSMARCO_TEST_QUERIES_PATH = Path("./assets/msmarco/queries.dev.tsv")
-MSMARCO_TEST_QRELS_PATH = Path("./assets/msmarco/qrels.dev.tsv")
+MSMARCO_DEV_QUERIES_PATH = Path("./assets/msmarco/queries.dev.tsv")
+MSMARCO_DEV_QRELS_PATH = Path("./assets/msmarco/qrels.dev.tsv")
+MSMARCO_DEV_TOP_1000_PATH = Path("./assets/msmarco/top1000.dev")
 SEED = 12
 BATCH_SIZE = 20
 EMBEDDING_SIZE = 768
@@ -136,6 +137,8 @@ class MinimalExample:
         y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())
         y = y.to(torch.float32).unsqueeze(1)
 
+        # P can be calculated with a closed form, since we are dealing with a linear regression
+        # (when we try to linearly predict the BM25 score from the models representation)
         P = self.rlace_linear_regression_closed_form(X, y)
         return P
 
@@ -207,7 +210,10 @@ class MinimalExample:
             doc.embedding = emb.mm(self.projection).squeeze(0).numpy()
             pass
         self.document_store.write_documents(
-            documents=docs, duplicate_documents="skip", index=self.index_name_probing, batch_size=300
+            documents=docs,
+            duplicate_documents="skip",
+            index=self.index_name_probing,
+            batch_size=300,
         )
 
     def _init_elasticsearch_bm25_index(self, pool):
@@ -224,18 +230,45 @@ class MinimalExample:
 
         return bm25
 
-    def _evaluate_performance(self):
-        queries = get_queries(MSMARCO_TEST_QUERIES_PATH)
-        qrels = get_qrels(MSMARCO_TEST_QRELS_PATH)
-        reciprocal_ranks = []
-        reciprocal_ranks_probing = []
+    def _evaluate_performance(self, mrr_at: int = 10, recall_at: int = 1000):
+        queries = get_queries(MSMARCO_DEV_QUERIES_PATH)
+        # TODO: get top1000 via elastic search index?
+        top1000 = get_top_1000_passages(MSMARCO_DEV_TOP_1000_PATH)
+
+        # qrels = get_qrels(MSMARCO_DEV_QRELS_PATH)
+        reciprocal_ranks, recalls = [], []
+        reciprocal_ranks_probing, recalls_probing = [], []
+
+        def reciprocal_rank(rel_docs: list[Document], relevant_pid: int):
+            for j, doc in enumerate(rel_docs):
+                if (
+                    doc.meta["vector_id"] == relevant_pid
+                ):  # vectore_id is a counter which corresponds to pid,
+                    # however it would be better to have the meta data given the documents
+                    return (j + 1) / len(relevant_docs)
+            return 0
+
+        def recall(rel_docs: list[Document], relevant_pids: list[int]):
+            assert len(rel_docs) == len(
+                relevant_pids
+            ), "Number of relevant docs returned by the doc store and ground truth docs does not match"
+            rel_docs_counter = 0
+            for doc in rel_docs:
+                if (
+                    doc.meta["vector_id"] in relevant_pids
+                ):  # vectore_id is a counter which corresponds to pid,
+                    # however it would be better to have the meta data given the documents
+                    rel_docs_counter += 1
+            return rel_docs_counter / len(rel_docs)
 
         # get query embedding
         for i, row in enumerate(queries.iterrows()):
             logging.debug(f"Evaluating query {i + 1}/{len(queries)}")
-            # TODO: what should happen if there is no corresponding qrel to a query? For now: Skip this query
             try:
-                relevant_pid = qrels[qrels["qid"] == row[1][0]]["pid"].values[0]
+                # relevant_pid = qrels[qrels["qid"] == row[1][0]]["pid"].values[0]
+                top_relevant_pid = top1000[row[1][0]][0]
+                relevant_pids = top1000[row[1][0]]
+                pass
             except:
                 continue
             X_query_tokenized = self.tokenizer(
@@ -249,47 +282,42 @@ class MinimalExample:
             q_emb_probing = q_emb.mm(self.projection)
             q_emb = q_emb.squeeze(0).numpy()
             q_emb_probing = q_emb_probing.squeeze(0).numpy()
-            relevant_docs = self.document_store.query_by_embedding(q_emb, index="tct_colbert")
+            relevant_docs = self.document_store.query_by_embedding(
+                q_emb, index=self.index_name, top_k=recall_at
+            )
             relevant_docs_probing = self.document_store.query_by_embedding(
-                q_emb_probing, index="tct_colbert"
+                q_emb_probing, index=self.index_name_probing, top_k=recall_at
             )
 
-            # calculating MRR@10
-            reciprocal_rank = 0
-            reciprocal_rank_probing = 0
-            for j, (doc1, doc2) in enumerate(zip(relevant_docs, relevant_docs_probing)):
-                if (
-                    doc1.meta["vector_id"] == relevant_pid
-                ):  # vectore_id is a counter which corresponds to pid,
-                    # however it would be better to have the meta data given the documents
-                    reciprocal_rank = (j + 1) / len(relevant_docs)
-                if doc2.meta["vector_id"] == relevant_pid:
-                    reciprocal_rank_probing = (j + 1) / len(relevant_docs)
-            reciprocal_ranks.append(reciprocal_rank)
-            reciprocal_ranks_probing.append(reciprocal_rank_probing)
+            # calculate MRR@10
+            reciprocal_ranks.append(reciprocal_rank(relevant_docs[:mrr_at], top_relevant_pid))
+            reciprocal_ranks_probing.append(reciprocal_rank(relevant_docs_probing[:mrr_at], top_relevant_pid))
+
+            # calculate Recall@1000
+            recalls.append(recall(relevant_docs, relevant_pids))
+            recalls_probing.append(recall(relevant_docs_probing, relevant_pids))
 
         mrr = np.mean(reciprocal_ranks)
         mrr_probing = np.mean(reciprocal_ranks_probing)
+        r = np.mean(recalls)
+        r_probing = np.mean(recalls_probing)
+
 
         logging.info(
             f"""   
-        Model/Probing Task    | MRR@10
-        {self.index_name}    | {mrr}
-        {self.index_name_probing}    | {mrr_probing}                    
+        Model/Probing Task    | MRR@10 | R@1000
+        {self.index_name}    | {mrr:.3f} | {r:.3f}
+        {self.index_name_probing}    | {mrr_probing:.3f} | {r_probing:.3f}                
         """
         )
 
-        return mrr, mrr_probing
+        return mrr, mrr_probing, r, r_probing
 
 
 def main(args):
     model_choice = args.models.split(",")[0]
     probing_task = args.tasks.split(",")[0]
     min_ex = MinimalExample(model_choice, probing_task, args.reindex)
-
-    # P can be calculated with a closed form, since we are dealing with a linear regression
-    # (when we try to linearly predict the BM25 score from the models representation)
-
     pass
 
     # Ps_rlace, accs_rlace = {}, {}
