@@ -3,3 +3,4 @@ pandas
 transformers
 scikit-learn
 ftfy
+rank_bm25

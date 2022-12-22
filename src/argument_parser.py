@@ -16,7 +16,7 @@ def parse_arguments():
         "--tasks",
         type=str,
         dest="tasks",
-        default="bm25,semsim,ner,tf",
+        default="bm25",
         help="Tasks to run. Possible tasks are: ['bm25', 'tf', 'semsim', 'ner', 'corefres', 'factchecking']. Should be comma seperated",
     )
     parser.add_argument(

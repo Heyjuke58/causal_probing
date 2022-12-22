@@ -1,5 +1,7 @@
 .vscode/
 assets/
+cache/
+logs/
 src/X*
 faiss_document_store.db
 *.pickle
