@@ -7,7 +7,8 @@ import numpy as np
 import pickle
 import math
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
+from transformers.models.auto.modeling_auto import AutoModel
+from transformers.models.auto.tokenization_auto import AutoTokenizer
 from haystack.document_stores.faiss import FAISSDocumentStore
 from haystack.nodes import EmbeddingRetriever
 from haystack.schema import Document
@@ -161,10 +162,10 @@ class MinimalExample:
         )
 
     def _bm25_probing_task(self):
-        X_query = np.array([x["query"] for x in self.train["input"].values])
-        X_passage = np.array([x["passage"] for x in self.train["input"].values])
+        X_query = np.array([x["query"] for x in self.train["input"].values]) # type: ignore
+        X_passage = np.array([x["passage"] for x in self.train["input"].values]) # type: ignore
         X = self._get_X_probing_task(X_query, X_passage, BATCH_SIZE_FP, "multiply_elementwise")
-        y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())
+        y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy()) # type: ignore
         y = y.to(torch.float32).unsqueeze(1)
 
         # P can be calculated with a closed form, since we are dealing with a linear regression
@@ -411,9 +412,9 @@ class MinimalExample:
                 q_emb_probing, index=self.index_name_probing, top_k=recall_at
             )
             docs_dict = {doc.id: doc.score for doc in relevant_docs}
-            predictions[str(qid)] = docs_dict
+            predictions[str(qid)] = docs_dict # type: ignore
             docs_dict = {doc.id: doc.score for doc in relevant_docs_probing}
-            predictions_probing[str(qid)] = docs_dict
+            predictions_probing[str(qid)] = docs_dict # type: ignore
 
             # calculate MRR@10
             reciprocal_ranks.append(reciprocal_rank(relevant_docs[:mrr_at], top1_relevant_pid))
