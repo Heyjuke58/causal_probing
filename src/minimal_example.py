@@ -176,7 +176,8 @@ class MinimalExample:
     def _init_faiss_doc_store_and_es_bm25(self, reindex=False, batch_size: int = 20):
         if reindex:
             corpus_df = get_corpus(MSMARCO_CORPUS_PATH)
-            es_bm25 = self._init_elasticsearch_bm25_index(corpus_df["passage"].to_dict())
+            # es_bm25 = self._init_elasticsearch_bm25_index(corpus_df["passage"].to_dict())
+            es_bm25 = None
             doc_store = FAISSDocumentStore(
                 sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name}.db",
                 faiss_index_factory_str=self.faiss_index_factory_str,
@@ -216,19 +217,33 @@ class MinimalExample:
                         )
                     )
                 del embs  # free memory
-                if len(docs) > CHUNK_SIZE:
+                if len(docs) >= CHUNK_SIZE:
+                    clipped_docs = docs[:CHUNK_SIZE]
+                    rest_docs = docs[CHUNK_SIZE:]
                     doc_store.write_documents(
-                        documents=docs, duplicate_documents="skip", index=self.index_name
+                        documents=clipped_docs, duplicate_documents="skip", index=self.index_name
                     )
-                    chunk = torch.zeros((min(CHUNK_SIZE, corpus_df.shape[0] - chunk_counter * CHUNK_SIZE), 768))
+                    chunk = torch.zeros((CHUNK_SIZE, 768))
                     chunk_str = f"./cache/emb_chunks/{self.index_name}_embs_chunk_{chunk_counter}.pt"
-                    for i, doc in enumerate(docs):
+                    for i, doc in enumerate(clipped_docs):
                         emb = torch.tensor(doc.embedding).unsqueeze(0)
-                        chunk[i % CHUNK_SIZE] = emb
+                        chunk[i] = emb
                     torch.save(chunk, chunk_str)
-                    del chunk # free memory
+                    # free memory
+                    del chunk
+                    del docs
                     chunk_counter += 1
-                    docs = []
+                    docs = rest_docs
+            # last chunk which is not the usual chunk size
+            chunk = torch.zeros((corpus_df.shape[0] - chunk_counter * CHUNK_SIZE, 768))
+            chunk_str = f"./cache/emb_chunks/{self.index_name}_embs_chunk_{chunk_counter}.pt"
+            for i, doc in enumerate(docs):
+                emb = torch.tensor(doc.embedding).unsqueeze(0)
+                chunk[i] = emb
+            torch.save(chunk, chunk_str)
+            # free memory
+            del chunk
+            del docs
             logging.info("Vanilla document embeddings added to document store.")
             # save faiss index and embeddings
             with open(f"./cache/{self.index_name}.pickle", "wb+") as faiss_index_file:
