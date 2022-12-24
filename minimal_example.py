@@ -1,6 +1,8 @@
+import sys
+sys.path.insert(1, './ranking-utils')
+sys.path.insert(1, './haystack')
 from pathlib import Path
 import logging
-import sys
 import torch
 import pandas as pd
 import numpy as np
@@ -10,13 +12,19 @@ from tqdm import tqdm
 from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from haystack.document_stores.faiss import FAISSDocumentStore
-from haystack.nodes import EmbeddingRetriever
 from haystack.schema import Document
 
 from ranking_utils import write_trec_eval_file
-from trec_evaluation import trec_evaluation
-from utils import get_corpus, get_qrels, get_queries, get_top_1000_passages, fuse_chunks, get_timestamp
-from argument_parser import parse_arguments
+from src.trec_evaluation import trec_evaluation
+from src.utils import (
+    get_corpus,
+    get_qrels,
+    get_queries,
+    get_top_1000_passages,
+    fuse_chunks,
+    get_timestamp,
+)
+from src.argument_parser import parse_arguments
 
 from src.elasticsearch_bm25 import ElasticSearchBM25
 from src.rlace import solve_adv_game
@@ -33,7 +41,7 @@ MSMARCO_TEST_43_QUERIES_PATH = Path("./assets/msmarco/trec_43_test_queries.tsv")
 MSMARCO_QREL_2019_PATH = "/home/hinrichs/causal_probing/assets/msmarco/2019-qrels-pass.txt"
 
 ## TREC EVAL
-TREC_EVAL = Path("/home/hinrichs/causal_probing/trec_eval")
+TREC_EVAL = "/home/hinrichs/causal_probing/trec_eval"
 
 ## MODELS
 MODEL_CHOICES = {"tct_colbert": "castorini/tct_colbert-v2-hnp-msmarco"}
@@ -43,7 +51,7 @@ SEED = 12
 BATCH_SIZE_FP = 10
 EMBEDDING_SIZE = 768
 CHUNK_SIZE = int(1e6)
-CHUNK_AMOUNT = math.ceil(int(8.8e6) / CHUNK_SIZE) # 8.8M is the corpus size
+CHUNK_AMOUNT = math.ceil(int(8.8e6) / CHUNK_SIZE)  # 8.8M is the corpus size
 
 
 class MinimalExample:
@@ -162,10 +170,10 @@ class MinimalExample:
         )
 
     def _bm25_probing_task(self):
-        X_query = np.array([x["query"] for x in self.train["input"].values]) # type: ignore
-        X_passage = np.array([x["passage"] for x in self.train["input"].values]) # type: ignore
+        X_query = np.array([x["query"] for x in self.train["input"].values])  # type: ignore
+        X_passage = np.array([x["passage"] for x in self.train["input"].values])  # type: ignore
         X = self._get_X_probing_task(X_query, X_passage, BATCH_SIZE_FP, "multiply_elementwise")
-        y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy()) # type: ignore
+        y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())  # type: ignore
         y = y.to(torch.float32).unsqueeze(1)
 
         # P can be calculated with a closed form, since we are dealing with a linear regression
@@ -178,6 +186,7 @@ class MinimalExample:
             corpus_df = get_corpus(MSMARCO_CORPUS_PATH)
             # es_bm25 = self._init_elasticsearch_bm25_index(corpus_df["passage"].to_dict())
             es_bm25 = None
+            is_trained = False
             doc_store = FAISSDocumentStore(
                 sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name}.db",
                 faiss_index_factory_str=self.faiss_index_factory_str,
@@ -220,11 +229,16 @@ class MinimalExample:
                 if len(docs) >= CHUNK_SIZE:
                     clipped_docs = docs[:CHUNK_SIZE]
                     rest_docs = docs[CHUNK_SIZE:]
+                    if not is_trained:
+                        doc_store.train_index(docs, index=self.index_name)
+                        is_trained = True
                     doc_store.write_documents(
                         documents=clipped_docs, duplicate_documents="skip", index=self.index_name
                     )
                     chunk = torch.zeros((CHUNK_SIZE, 768))
-                    chunk_str = f"./cache/emb_chunks/{self.index_name}_embs_chunk_{chunk_counter}.pt"
+                    chunk_str = (
+                        f"./cache/emb_chunks/{self.index_name}_embs_chunk_{chunk_counter}.pt"
+                    )
                     for i, doc in enumerate(clipped_docs):
                         emb = torch.tensor(doc.embedding).unsqueeze(0)
                         chunk[i] = emb
@@ -281,6 +295,7 @@ class MinimalExample:
                 f"Adding new index {self.probing_task} of altered embeddings (RLACE/INLP) to second document store. "
                 f"Loading altered embeddings from local chunks ..."
             )
+            is_trained = False
             doc_store = FAISSDocumentStore(
                 sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name_probing}.db",
                 faiss_index_factory_str=self.faiss_index_factory_str,
@@ -292,8 +307,18 @@ class MinimalExample:
                 logging.info(f"Processing chunk {i + 1}/{CHUNK_AMOUNT}")
                 chunk_str = f"./cache/emb_chunks/{self.index_name}_embs_chunk_{i}.pt"
                 emb_docs_chunk = torch.load(chunk_str)
-                emb_docs_chunk_altered = torch.einsum('bc,cd->bd', emb_docs_chunk, projection)
-                docs = [Document(id=str(i * CHUNK_SIZE + j), content="", embedding=emb_docs_chunk_altered[j,:].squeeze(0).numpy()) for j in range(emb_docs_chunk_altered.shape[0])]
+                emb_docs_chunk_altered = torch.einsum("bc,cd->bd", emb_docs_chunk, projection)
+                docs = [
+                    Document(
+                        id=str(i * CHUNK_SIZE + j),
+                        content="",
+                        embedding=emb_docs_chunk_altered[j, :].squeeze(0).numpy(),
+                    )
+                    for j in range(emb_docs_chunk_altered.shape[0])
+                ]
+                if not is_trained:
+                    doc_store.train_index(docs, index=index_name_probing)
+                    is_trained = True
                 doc_store.write_documents(
                     documents=docs, duplicate_documents="skip", index=self.index_name_probing
                 )
@@ -312,7 +337,9 @@ class MinimalExample:
                 pickle.dump(doc_store.faiss_indexes[self.index_name_probing], faiss_index_file)
 
         else:
-            logging.info(f"Restoring document store with Faiss index of altered embeddings (task: {self.probing_task}) ...")
+            logging.info(
+                f"Restoring document store with Faiss index of altered embeddings (task: {self.probing_task}) ..."
+            )
             if Path(faiss_index_file_str).is_file():
                 with open(faiss_index_file_str, "rb") as faiss_index_file:
                     faiss_index = pickle.load(faiss_index_file)
@@ -355,8 +382,12 @@ class MinimalExample:
         # qrels = get_qrels(MSMARCO_DEV_QRELS_PATH)
         reciprocal_ranks, recalls = [], []
         reciprocal_ranks_probing, recalls_probing = [], []
-        predictions: dict[str, dict[str, float]] = {} # Query IDs mapped to document IDs mapped to scores.
-        predictions_probing: dict[str, dict[str, float]] = {} # Query IDs mapped to document IDs mapped to scores.
+        predictions: dict[
+            str, dict[str, float]
+        ] = {}  # Query IDs mapped to document IDs mapped to scores.
+        predictions_probing: dict[
+            str, dict[str, float]
+        ] = {}  # Query IDs mapped to document IDs mapped to scores.
 
         def reciprocal_rank(rel_docs: list[Document], relevant_pid: int):
             for j, doc in enumerate(rel_docs):
@@ -374,7 +405,7 @@ class MinimalExample:
             rel_docs_counter = 0
             for i, doc in enumerate(relevant_docs):
                 # return early if there are not 1000 associated relevant pids
-                if (i >= len(relevant_pids)):
+                if i >= len(relevant_pids):
                     return rel_docs_counter / len(relevant_pids)
                 if (
                     doc.meta["vector_id"] in relevant_pids
@@ -427,9 +458,9 @@ class MinimalExample:
                 q_emb_probing, index=self.index_name_probing, top_k=recall_at
             )
             docs_dict = {doc.id: doc.score for doc in relevant_docs}
-            predictions[str(qid)] = docs_dict # type: ignore
+            predictions[str(qid)] = docs_dict  # type: ignore
             docs_dict = {doc.id: doc.score for doc in relevant_docs_probing}
-            predictions_probing[str(qid)] = docs_dict # type: ignore
+            predictions_probing[str(qid)] = docs_dict  # type: ignore
 
             # calculate MRR@10
             reciprocal_ranks.append(reciprocal_rank(relevant_docs[:mrr_at], top1_relevant_pid))
@@ -455,13 +486,24 @@ class MinimalExample:
         )
         logging.info(f"Starting official TREC evaluation.")
         write_trec_eval_file(Path(self.trec_eval_file), predictions, self.probing_task)
-        write_trec_eval_file(Path(self.trec_eval_file_probing), predictions_probing, self.probing_task)
+        write_trec_eval_file(
+            Path(self.trec_eval_file_probing), predictions_probing, self.probing_task
+        )
 
         # For trec evaluation
         out_file = Path(f"./logs/results/trec_eval_{self.index_name}.tsv")
         out_file_probing = Path(f"./logs/results/trec_eval_{self.index_name_probing}.tsv")
-        trec_evaluation(out_file, self.model_choice, MSMARCO_QREL_2019_PATH, TREC_EVAL, self.trec_eval_file, 0)
-        trec_evaluation(out_file_probing, self.model_choice, MSMARCO_QREL_2019_PATH, TREC_EVAL, self.trec_eval_file_probing, 0)
+        trec_evaluation(
+            out_file, self.model_choice, MSMARCO_QREL_2019_PATH, TREC_EVAL, self.trec_eval_file, 0
+        )
+        trec_evaluation(
+            out_file_probing,
+            self.model_choice,
+            MSMARCO_QREL_2019_PATH,
+            TREC_EVAL,
+            self.trec_eval_file_probing,
+            0,
+        )
 
         return mrr, mrr_probing, r, r_probing
 
@@ -502,7 +544,9 @@ if __name__ == "__main__":
             root.removeHandler(handler)
     log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-    file_handler = logging.FileHandler(f"./logs/{model_choice}_{probing_task}_{get_timestamp()}.log")
+    file_handler = logging.FileHandler(
+        f"./logs/{model_choice}_{probing_task}_{get_timestamp()}.log"
+    )
     file_handler.setFormatter(log_formatter)
     file_handler.setLevel(logging.INFO)
     root.addHandler(file_handler)

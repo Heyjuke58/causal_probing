@@ -5,6 +5,12 @@ logs/
 src/X*
 faiss_document_store.db
 *.pickle
+stderr.txt
+stdout.txt
+htcondor.log
+submission.sub
+run_experiment.sh
+notes.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
