@@ -1,6 +1,7 @@
 import sys
-sys.path.insert(1, './ranking-utils')
-sys.path.insert(1, './haystack')
+
+sys.path.insert(1, "./ranking-utils")
+sys.path.insert(1, "./haystack")
 from pathlib import Path
 import logging
 import torch
@@ -56,13 +57,27 @@ CHUNK_AMOUNT = math.ceil(int(8.8e6) / CHUNK_SIZE)  # 8.8M is the corpus size
 
 class MinimalExample:
     def __init__(
-        self, model_choice: str = "tct_colbert", probing_task: str = "bm25", reindex: bool = False
+        self,
+        model_choice: str = "tct_colbert",
+        probing_task: str = "bm25",
+        reindex_original: bool = False,
+        reindex_task: bool = False,
+        prepend_token: bool = False,
+        device_cpu: bool = False,
+        chunked_read_in: bool = False,
     ) -> None:
         self.TASKS = {"bm25": self._bm25_probing_task}
         self.model_choice_hf_str = MODEL_CHOICES[model_choice]
         self.model_choice = model_choice
         self.probing_task = probing_task
         self.dataset = pd.read_json(DATASET_PATH, orient="records")
+        self.prepend_token = (
+            prepend_token  # whether to prepend '[Q]' and '[D]' to query and document text
+            # results in tokenized list: 101, 1031 ([), xxxx (Q/D), 1033 (]), ...
+        )
+        self.reindex_original = reindex_original
+        self.reindex_task = reindex_task
+        self.chunked_read_in = chunked_read_in  # whether to create doc store from chunked embeddings instead of saved index file
 
         # index params
         self.faiss_index_factory_str = "IVF30000,Flat"
@@ -75,8 +90,12 @@ class MinimalExample:
 
         self.train, self.val, self.test = self._train_val_test_split()
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # self.device = "cpu"
+        if device_cpu:
+            self.device = torch.device("cpu")
+        else:
+            if not torch.cuda.is_available():
+                raise Exception("CUDA is not available, but torch device is not set to cpu.")
+            self.device = torch.device("cuda")
 
         # init model
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_choice_hf_str)
@@ -85,12 +104,10 @@ class MinimalExample:
         self.projection = self.TASKS[self.probing_task]()  # projection to remove a concept
         # init document store
         self.doc_store, self.es_bm25 = self._init_faiss_doc_store_and_es_bm25(
-            reindex=reindex, batch_size=BATCH_SIZE_FP
+            batch_size=BATCH_SIZE_FP
         )
         # add index for embeddings after projection of probing task is applied
-        self.probing_doc_store = self._add_index_to_doc_store(
-            self.index_name_probing, self.projection, reindex=reindex
-        )
+        self.probing_doc_store = self._add_index_to_doc_store(self.projection)
 
         self._evaluate_performance()
 
@@ -170,8 +187,8 @@ class MinimalExample:
         )
 
     def _bm25_probing_task(self):
-        X_query = np.array([x["query"] for x in self.train["input"].values])  # type: ignore
-        X_passage = np.array([x["passage"] for x in self.train["input"].values])  # type: ignore
+        X_query = np.array(["[Q] " + x["query"] if self.prepend_token else x["query"] for x in self.train["input"].values])  # type: ignore
+        X_passage = np.array(["[D] " + x["passage"] if self.prepend_token else x["passage"] for x in self.train["input"].values])  # type: ignore
         X = self._get_X_probing_task(X_query, X_passage, BATCH_SIZE_FP, "multiply_elementwise")
         y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())  # type: ignore
         y = y.to(torch.float32).unsqueeze(1)
@@ -181,8 +198,10 @@ class MinimalExample:
         P = self.rlace_linear_regression_closed_form(X, y)
         return P
 
-    def _init_faiss_doc_store_and_es_bm25(self, reindex=False, batch_size: int = 20):
-        if reindex:
+    def _init_faiss_doc_store_and_es_bm25(
+        self, batch_size: int = 20
+    ):
+        if self.reindex_original:
             corpus_df = get_corpus(MSMARCO_CORPUS_PATH)
             # es_bm25 = self._init_elasticsearch_bm25_index(corpus_df["passage"].to_dict())
             es_bm25 = None
@@ -193,7 +212,11 @@ class MinimalExample:
                 index=self.index_name,
                 duplicate_documents="skip",
             )
-            passages = corpus_df["passage"].tolist()
+            passages = (
+                corpus_df["passage"]
+                .apply(lambda x: "[D] " + x if self.prepend_token else x)
+                .tolist()
+            )
             pids = corpus_df["pid"].tolist()
             docs = []
 
@@ -204,7 +227,7 @@ class MinimalExample:
             )
             chunk_counter = 0
 
-            for i in tqdm(range(batches)):
+            for i in range(batches):
                 X_passage_tokenized = self.tokenizer(
                     passages[batch_size * i : min(batch_size * (i + 1), len(corpus_df))],
                     padding=True,
@@ -212,13 +235,12 @@ class MinimalExample:
                     max_length=512,
                     return_tensors="pt",
                 ).to(self.device)
-                embs = (
-                    self.model(**X_passage_tokenized).pooler_output.detach().cpu()
-                )  # maybe prepend '[D]'?
+                embs = self.model(**X_passage_tokenized).pooler_output.detach().cpu()
                 del X_passage_tokenized  # free memory
                 for j in range(embs.shape[0]):
                     emb = embs[j, :]
                     docs.append(
+                        # TODO: set id and remove content if not used anymore
                         Document(
                             content=passages[i * batch_size + j],
                             embedding=emb,
@@ -230,8 +252,10 @@ class MinimalExample:
                     clipped_docs = docs[:CHUNK_SIZE]
                     rest_docs = docs[CHUNK_SIZE:]
                     if not is_trained:
+                        logging.info("Training index...")
                         doc_store.train_index(docs, index=self.index_name)
                         is_trained = True
+                        logging.info("Training index complete.")
                     doc_store.write_documents(
                         documents=clipped_docs, duplicate_documents="skip", index=self.index_name
                     )
@@ -268,29 +292,63 @@ class MinimalExample:
             # fuse_chunks(f"./cache/{self.index_name}_embs", chunk_counter)
 
         else:
-            # es_bm25 = self._init_elasticsearch_bm25_index(
-            #     {}
-            # )  # init ES with empty pool, since it has already been indexed.
             es_bm25 = None
-            logging.info("Restoring document store with Faiss index...")
-            doc_store = None
-            with open(f"./cache/{self.index_name}.pickle", "rb") as faiss_index_file:
-                faiss_index = pickle.load(faiss_index_file)
+            if self.chunked_read_in:
+                logging.info("Restoring document store with chunked embeddings...")
+                is_trained = False
                 doc_store = FAISSDocumentStore(
                     sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name}.db",
                     faiss_index_factory_str=self.faiss_index_factory_str,
                     index=self.index_name,
                     duplicate_documents="skip",
-                    faiss_index=faiss_index,
                 )
-            logging.info("Document store with Faiss index restored.")
+                for i in range(CHUNK_AMOUNT):
+                    logging.info(f"Processing chunk {i + 1}/{CHUNK_AMOUNT}")
+                    chunk_str = f"./cache/emb_chunks/{self.index_name}_embs_chunk_{i}.pt"
+                    emb_docs_chunk = torch.load(chunk_str)
+                    docs = [
+                        Document(
+                            id=str(i * CHUNK_SIZE + j),
+                            content="",
+                            embedding=emb_docs_chunk[j, :].squeeze(0).numpy(),
+                        )
+                        for j in range(emb_docs_chunk.shape[0])
+                    ]
+                    if not is_trained:
+                        logging.info("Training index...")
+                        doc_store.train_index(docs, index=self.index_name)
+                        is_trained = True
+                        logging.info("Training index complete.")
+                    doc_store.write_documents(
+                        documents=docs, duplicate_documents="skip", index=self.index_name
+                    )
+                logging.info("Vanilla document embeddings added to document store.")
+                # save faiss index
+                with open(f"./cache/{self.index_name}.pickle", "wb+") as faiss_index_file:
+                    pickle.dump(doc_store.faiss_indexes[self.index_name], faiss_index_file)
+                logging.info("Saved Faiss index file.")
+            else:
+                # es_bm25 = self._init_elasticsearch_bm25_index(
+                #     {}
+                # )  # init ES with empty pool, since it has already been indexed.
+                logging.info("Restoring document store with Faiss index...")
+                doc_store = None
+                with open(f"./cache/{self.index_name}.pickle", "rb") as faiss_index_file:
+                    faiss_index = pickle.load(faiss_index_file)
+                    doc_store = FAISSDocumentStore(
+                        sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name}.db",
+                        faiss_index_factory_str=self.faiss_index_factory_str,
+                        index=self.index_name,
+                        duplicate_documents="skip",
+                        faiss_index=faiss_index,
+                    )
+                logging.info("Document store with Faiss index restored.")
 
         return doc_store, es_bm25
 
-    def _add_index_to_doc_store(self, index_name_probing, projection, reindex=False):
+    def _add_index_to_doc_store(self, projection):
         faiss_index_file_str = f"./cache/{self.index_name_probing}.pickle"
-        if reindex:
-            # TODO: checken ob alle embeddings in RAM passen, sonst -> chunked einlesen -> chunk fuse obsolet
+        if self.reindex_task or self.chunked_read_in:
             logging.info(
                 f"Adding new index {self.probing_task} of altered embeddings (RLACE/INLP) to second document store. "
                 f"Loading altered embeddings from local chunks ..."
@@ -299,7 +357,7 @@ class MinimalExample:
             doc_store = FAISSDocumentStore(
                 sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name_probing}.db",
                 faiss_index_factory_str=self.faiss_index_factory_str,
-                index=index_name_probing,
+                index=self.index_name_probing,
                 duplicate_documents="skip",
             )
 
@@ -317,7 +375,7 @@ class MinimalExample:
                     for j in range(emb_docs_chunk_altered.shape[0])
                 ]
                 if not is_trained:
-                    doc_store.train_index(docs, index=index_name_probing)
+                    doc_store.train_index(docs, index=self.index_name_probing)
                     is_trained = True
                 doc_store.write_documents(
                     documents=docs, duplicate_documents="skip", index=self.index_name_probing
@@ -346,7 +404,7 @@ class MinimalExample:
                     doc_store = FAISSDocumentStore(
                         sql_url=f"sqlite:///cache/faiss_doc_store_{self.index_name_probing}.db",
                         faiss_index_factory_str=self.faiss_index_factory_str,
-                        index=index_name_probing,
+                        index=self.index_name_probing,
                         duplicate_documents="skip",
                         faiss_index=faiss_index,
                     )
@@ -417,7 +475,7 @@ class MinimalExample:
         # get query embedding
         for i, row in tqdm(queries.iterrows(), desc="Evaluating"):
             qid = row[0]
-            query = row[1]
+            query = "[Q] " + row[1] if self.prepend_token else row[1]
             try:
                 ## GETTING GROUND TRUTH BUT HOW?
 
@@ -508,8 +566,8 @@ class MinimalExample:
         return mrr, mrr_probing, r, r_probing
 
 
-def main(args, model_choice, probing_task):
-    min_ex = MinimalExample(model_choice, probing_task, args.reindex)
+def main(args):
+    min_ex = MinimalExample(**args)
     pass
 
     # Ps_rlace, accs_rlace = {}, {}
@@ -535,8 +593,6 @@ def main(args, model_choice, probing_task):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    model_choice = args.models.split(",")[0]
-    probing_task = args.tasks.split(",")[0]
 
     root = logging.getLogger()
     if root.handlers:
@@ -545,7 +601,7 @@ if __name__ == "__main__":
     log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
     file_handler = logging.FileHandler(
-        f"./logs/{model_choice}_{probing_task}_{get_timestamp()}.log"
+        f"./logs/{args.model_choice}_{args.probing_task}_{get_timestamp()}.log"
     )
     file_handler.setFormatter(log_formatter)
     file_handler.setLevel(logging.INFO)
@@ -557,4 +613,5 @@ if __name__ == "__main__":
     root.addHandler(console_handler)
     root.setLevel(logging.INFO)
 
-    main(args, model_choice, probing_task)
+    args = vars(args)
+    main(args)
