@@ -4,12 +4,20 @@ import pandas as pd
 import logging
 import ftfy
 import time
+import math
 
 import pickle
 import os
 
 def get_timestamp() -> str:
     return time.strftime("%Y_%m_%d-%H-%M-%S")
+
+def get_batch_amount(size, batch_size) -> int:
+    return (
+        math.floor(size / batch_size) + 1
+        if not (size / batch_size).is_integer()
+        else int(size / batch_size)
+    )
 
 def fuse_chunks(file_prefix: str, amount: int):
     # fuse chunked files

@@ -4,3 +4,5 @@ transformers
 scikit-learn
 ftfy
 rank_bm25
+matplotlib
+pyserini

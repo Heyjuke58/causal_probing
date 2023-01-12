@@ -5,9 +5,12 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("-ro", "--reindex_original", dest="reindex_original", action="store_true")
     parser.add_argument("-rt", "--reindex_task", dest="reindex_task", action="store_true")
-    parser.add_argument("-p", "--prepend_token", dest="prepend_token", action="store_true")
-    parser.add_argument("-d", "--device_cpu", dest="device_cpu", action="store_true")
+    parser.add_argument("--do_not_prepend_token", dest="prepend_token", action="store_false")
     parser.add_argument("-c", "--chunked_read_in", dest="chunked_read_in", action="store_true")
+    parser.add_argument("-es", "--init_elastic_search", dest="init_elastic_search", action="store_true")
+    parser.add_argument("--all_layers", dest="all_layers", action="store_true")
+    parser.add_argument("--debug", dest="debug", action="store_true")
+    parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
     parser.add_argument(
         "-m",
         "--model",
@@ -23,6 +26,22 @@ def parse_arguments():
         dest="probing_task",
         default="bm25",
         help="Task to run. Possible tasks are: bm25, to be continued.",
+    )
+    parser.add_argument(
+        "-i",
+        "--index_str",
+        type=str,
+        dest="faiss_index_factory_str",
+        default="IVF30000,Flat",
+        help="Faiss index factory string. See https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index for more details.",
+    )
+    parser.add_argument(
+        "-f",
+        "--doc_store_framework",
+        type=str,
+        dest="doc_store_framework",
+        default="haystack",
+        help="Framewokr to build document store.",
     )
 
     args = parser.parse_args()

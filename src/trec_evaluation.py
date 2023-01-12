@@ -145,20 +145,13 @@ if __name__ == '__main__':
     ap.add_argument('--stat_sig_base_path', type=str,
                     default="/home/aanand/data/model/scl/test_vic_1k_glove/lightning_logs/version_7/trec_vic_test_1k_glove.tsv",
                     help='base file for stat significance')
-    ap.add_argument('--trec_eval', action='store_true', help='Set True for TRECDL test')
 
     args = ap.parse_args()
-    if args.trec_eval:
-        eval = TrecEvaluation(vars(args))
-        out_dir = Path(args.save_dir)
-        log_path = str(out_dir / 'lightning_logs' / str(args.version_num)) + str('/')
-        eval.log_and_results(log_path, 0.4, 1, 'results.txt')
+    eval = TrecEvaluation(vars(args))
+    out_dir = Path(args.save_dir)
+    log_path = str(out_dir / 'lightning_logs' / str(args.version_num)) + str('/')
+    eval.log_and_results(log_path, 0.4, 1, 'results.txt')
 
-        if args.test_trecdl_20:
-            print('Prediction for TRECDL-20')
-            eval.log_and_results(log_path, 'results_20.txt', True)
-    else:
-        base_file = '/home/aanand/data/result/vic/vic_test_cont/0.1/0.0/fold1_robust_9.txt'
-        final_file = '/home/aanand/data/result/vic/vic_test_cont/0.1/1.0/fold1_robust_0.txt'
-        # statistical_significance(args.qrel_file, base_file, final_file)
-        stattistical_ttest_rel(base_file, final_file)
+    if args.test_trecdl_20:
+        print('Prediction for TRECDL-20')
+        eval.log_and_results(log_path, 'results_20.txt', True)
