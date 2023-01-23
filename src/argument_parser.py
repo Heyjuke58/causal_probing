@@ -7,10 +7,12 @@ def parse_arguments():
     parser.add_argument("-rt", "--reindex_task", dest="reindex_task", action="store_true")
     parser.add_argument("--do_not_prepend_token", dest="prepend_token", action="store_false")
     parser.add_argument("-c", "--chunked_read_in", dest="chunked_read_in", action="store_true")
+    parser.add_argument("--generate_emb_chunks", dest="generate_emb_chunks", action="store_true")
     parser.add_argument("-es", "--init_elastic_search", dest="init_elastic_search", action="store_true")
     parser.add_argument("--all_layers", dest="all_layers", action="store_true")
     parser.add_argument("--debug", dest="debug", action="store_true")
     parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
+    parser.add_argument("--ablation_last_layer", dest="ablation_last_layer", action="store_true")
     parser.add_argument(
         "-m",
         "--model",
