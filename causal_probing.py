@@ -14,7 +14,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from multiprocessing import Pool
 
-from transformers.models.bert.modeling_bert import BertModel, BertEncoder
+from transformers.models.bert.modeling_bert import BertModel
 from transformers.models.bert.tokenization_bert import BertTokenizer
 from haystack.document_stores.faiss import FAISSDocumentStore
 from haystack.schema import Document
@@ -57,23 +57,32 @@ class CausalProber:
         ablation_last_layer: bool = False,
         debug: bool = False,
     ) -> None:
+        # Running options
         self.TASKS = {"bm25": self._init_probing_task, "sem_sim": self._init_probing_task}
         self.model_huggingface_str = MODEL_CHOICES[model_choice]
         self.model_choice = model_choice
         self.probing_task = probing_task
         self.all_layers = all_layers
-        self.dataset = pd.read_json(DATASET_PATHS[probing_task], orient="records")
-        self.corpus = {}  # empty dict or dataframe
         self.prepend_token = (
             prepend_token  # whether to prepend '[Q]' and '[D]' to query and document text
             # results in tokenized list: 101, 1031 ([), xxxx (Q/D), 1033 (]), ...
         )
+        self.generate_emb_chunks = generate_emb_chunks
+        self.reindex_original = reindex_original
+        self.reindex_task = reindex_task
+        self.chunked_read_in = chunked_read_in
+        self.ablation_last_layer = ablation_last_layer
+        self.debug = debug
+        self.doc_store_framework = doc_store_framework
+
+        self.dataset = pd.read_json(DATASET_PATHS[probing_task], orient="records")
+        self.corpus = {}  # empty dict or dataframe
 
         if debug:
             global MSMARCO_CORPUS_PATH
-            global MSMARCO_TREC_20XX_TEST_QUERIES_PATH
+            global MSMARCO_TREC_2019_TEST_QUERIES_PATH
             MSMARCO_CORPUS_PATH = MSMARCO_TOY_CORPUS_PATH
-            MSMARCO_TREC_20XX_TEST_QUERIES_PATH = MSMARCO_TOY_QUERIES_PATH
+            # MSMARCO_TREC_2019_TEST_QUERIES_PATH = MSMARCO_TOY_QUERIES_PATH
             global CHUNK_SIZE
             global CHUNK_AMOUNT
             CHUNK_SIZE = 3500
@@ -88,27 +97,15 @@ class CausalProber:
 
         # index params
         self.faiss_index_factory_str = faiss_index_factory_str
-        self.index_name = f"{self.model_choice}_{self.faiss_index_factory_str.replace(',', '_')}{'_debug' if debug else ''}"
-        self.index_name_probing = f"{self.model_choice}_{self.probing_task}_{self.faiss_index_factory_str.replace(',', '_')}{'_debug' if debug else ''}"
+        self.index_name = f"{self.model_choice}_{self.faiss_index_factory_str.replace(',', '_')}{'_debug' if debug else ''}_fixed_average"  # TODO: remove suffix!
+        self.index_name_probing = f"{self.model_choice}_{self.probing_task}_{self.faiss_index_factory_str.replace(',', '_')}{'_debug' if debug else ''} "
         self.chunk_name = f"{self.model_choice}{'_debug' if debug else ''}_embs_chunk"
         self.doc_store: FAISSDocumentStore
+        self.doc_store_pyserini: FaissSearcher
         self.probing_doc_stores: list[FAISSDocumentStore]  # one for each BERT layer
         self.probing_doc_store: FAISSDocumentStore
         self.probing_doc_store_average: FAISSDocumentStore  # for ablation test
         self.probing_doc_store_token_wise: FAISSDocumentStore  # for ablation test
-
-        # Evaluation files
-        self.trec_eval_file = f"./logs/trec/trec_eval_{self.index_name}.tsv"
-        self.trec_eval_file_probing_all_layers = (
-            f"./logs/trec/trec_eval_{self.index_name_probing}_layer"
-        )
-        self.trec_eval_file_probing = f"./logs/trec/trec_eval_{self.index_name_probing}.tsv"
-        self.trec_eval_file_probing_average = (
-            f"./logs/trec/trec_eval_{self.index_name_probing}_average.tsv"
-        )
-        self.trec_eval_file_probing_token_wise = (
-            f"./logs/trec/trec_eval_{self.index_name_probing}_token_wise.tsv"
-        )
 
         self.train, self.val, self.test = self._train_val_test_split()
 
@@ -128,45 +125,59 @@ class CausalProber:
         if doc_store_framework == "pyserini":
             self.query_encoder = TctColBertQueryEncoder(self.model_huggingface_str)
 
+    def run(self):
+        self.timestamp = get_timestamp()
         # run probing task
         self.projection = self.TASKS[self.probing_task]()  # projection to remove a concept
 
-        if generate_emb_chunks:
+        # if self.doc_store_framework == "pyserini":
+        #     self._index_faiss_doc_store_pyserini()
+
+        if self.generate_emb_chunks:
             self._generate_embeddings_and_save_them_chunked()
 
         # init document store
-        if reindex_original:
-            if chunked_read_in:
+        if self.reindex_original:
+            if self.chunked_read_in:
                 self._chunked_index_faiss_doc_store()
             else:
                 self._index_faiss_doc_store_no_chunk_save()
         else:
             self._init_indexed_faiss_doc_store()
 
-        # init second document store with index of embeddings after projection of probing task is applied
-        if reindex_task and not all_layers and not ablation_last_layer:
-            self._index_probing_faiss_doc_store()
-        elif reindex_task and all_layers and not ablation_last_layer:
-            self._index_probing_faiss_doc_stores_all_layers()
-        # elif not reindex_task and all_layers:
-        #     self._init_indexed_probing_faiss_doc_stores_all_layers()
-        elif ablation_last_layer:
-            self._init_probing_doc_stores_ablation_last_layer_non_parallel()
+        if self.debug:
+            # self._debug()
+            self._debug_embedding_score()
         else:
-            self._init_indexed_probing_faiss_doc_store()
+            self._evaluate(self.doc_store, self.index_name)
+
+        # # init second document store with index of embeddings after projection of probing task is applied
+        # if self.reindex_task and not self.all_layers and not self.ablation_last_layer:
+        #     self._index_probing_faiss_doc_store()
+        #     self._evaluate(self.probing_doc_store, self.index_name_probing, alter_query_emb=True)
+        # elif self.reindex_task and self.all_layers and not self.ablation_last_layer:
+        #     self._index_probing_faiss_doc_stores_all_layers()
+        # # elif not reindex_task and all_layers:
+        # #     self._init_indexed_probing_faiss_doc_stores_all_layers()
+        # elif self.ablation_last_layer:
+        #     self._init_probing_doc_stores_ablation_last_layer_non_parallel()
+        #     self._evaluate(
+        #         self.probing_doc_store_average,
+        #         self.index_name_probing,
+        #         alter_query_emb=True,
+        #         index_suffix="average",
+        #     )
+        #     self._evaluate(
+        #         self.probing_doc_store_token_wise,
+        #         self.index_name_probing,
+        #         alter_query_emb=True,
+        #         index_suffix="token_wise",
+        #     )
+        # else:
+        #     self._init_indexed_probing_faiss_doc_store()
 
         # if init_elastic_search:
         #     self.es_service = self._init_elastic_search_service()
-
-        # if debug:
-        #     self._debug()
-
-        if all_layers:
-            self._evaluate_performance_all_layers()
-        elif ablation_last_layer:
-            self._evaluate_ablation_last_layer()
-        else:
-            self._evaluate_performance()
 
     def _init_corpus(self):
         if not isinstance(self.corpus, pd.DataFrame):
@@ -249,31 +260,17 @@ class CausalProber:
         y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())  # type: ignore
         y = y.to(torch.float32).unsqueeze(1)
 
-        P = self.rlace_linear_regression_closed_form(X, y)
-        return P
-
-    def _bm25_probing_task(self):
-        X_query = np.array(["[Q] " + x["query"] if self.prepend_token else x["query"] for x in self.train["input"].values])  # type: ignore
-        X_passage = np.array(["[D] " + x["passage"] if self.prepend_token else x["passage"] for x in self.train["input"].values])  # type: ignore
-        X = self._get_X_probing_task(X_query, X_passage, "multiply_elementwise")
-        y = torch.from_numpy(self.train["targets"].apply(lambda x: x[0]["label"]).to_numpy())  # type: ignore
-        y = y.to(torch.float32).unsqueeze(1)
-
         # P can be calculated with a closed form, since we are dealing with a linear regression
         # (when we try to linearly predict the BM25 score from the models representation)
         P = self.rlace_linear_regression_closed_form(X, y)
         return P
 
-    def _sem_sim_probing_task(self):
-        X, y = self._init_probing_task()
-        P = self.rlace_linear_regression_closed_form(X, y)
-
-        return P
-
     def _index_faiss_doc_store_pyserini(self):
-        self.doc_store = FaissSearcher.from_prebuilt_index(
+        doc_store = FaissSearcher.from_prebuilt_index(
             "msmarco-passage-tct_colbert-v2-hnp-bf", self.query_encoder
         )
+        if doc_store:
+            self.doc_store_pyserini = doc_store
 
     @staticmethod
     def _cleanup_before_indexing(
@@ -343,10 +340,8 @@ class CausalProber:
         corpus_sample = self.corpus.sample(n=INDEX_TRAINING_SAMPLE_SIZE, random_state=SEED)  # type: ignore
         batches = get_batch_amount(INDEX_TRAINING_SAMPLE_SIZE, BATCH_SIZE_LM_MODEL)
         passages = (
-            corpus_sample["passage"]
-            .apply(lambda x: "[D] " + x if self.prepend_token else x)
-            .tolist()
-        )
+            "[D] " + corpus_sample["passage"] if self.prepend_token else corpus_sample["passage"]
+        ).tolist()
         p_embs = np.zeros(
             (AMOUNT_LAYERS, INDEX_TRAINING_SAMPLE_SIZE, EMBEDDING_SIZE), dtype="float32"
         )
@@ -374,13 +369,11 @@ class CausalProber:
             return
         logging.info("Training index...")
         self._init_corpus()
-        corpus_sample = self.corpus.sample(n=INDEX_TRAINING_SAMPLE_SIZE, random_state=SEED)
+        corpus_sample = self.corpus.sample(n=INDEX_TRAINING_SAMPLE_SIZE, random_state=SEED)  # type: ignore
         batches = get_batch_amount(INDEX_TRAINING_SAMPLE_SIZE, BATCH_SIZE_LM_MODEL)
         passages = (
-            corpus_sample["passage"]
-            .apply(lambda x: "[D] " + x if self.prepend_token else x)
-            .tolist()
-        )
+            "[D] " + corpus_sample["passage"] if self.prepend_token else corpus_sample["passage"]
+        ).tolist()
         # TODO: remove all_layers option when multiprocessing works
         if probing_task and self.all_layers:
             p_embs = np.zeros(
@@ -437,8 +430,8 @@ class CausalProber:
     def _generate_embeddings_and_save_them_chunked(self):
         self._init_corpus()
         passages = (
-            self.corpus["passage"].apply(lambda x: "[D] " + x if self.prepend_token else x).tolist()
-        )
+            "[D] " + self.corpus["passage"] if self.prepend_token else self.corpus["passage"]
+        ).tolist()
         corpus_size = len(passages)
         batches = get_batch_amount(corpus_size, BATCH_SIZE_LM_MODEL)
         chunk_counter = 0
@@ -495,9 +488,10 @@ class CausalProber:
 
         if self.faiss_index_factory_str != "Flat":
             self._train_index()
+
         passages = (
-            self.corpus["passage"].apply(lambda x: "[D] " + x if self.prepend_token else x).tolist()
-        )
+            "[D] " + self.corpus["passage"] if self.prepend_token else self.corpus["passage"]
+        ).tolist()
         pids = self.corpus["pid"].tolist()
         docs = []
         chunk_counter = 0
@@ -580,17 +574,18 @@ class CausalProber:
 
         if self.faiss_index_factory_str != "Flat":
             self._train_index()
+            self.doc_store.faiss_indexes[self.index_name].make_direct_map()
         passages = (
-            self.corpus["passage"].apply(lambda x: "[D] " + x if self.prepend_token else x).tolist()
-        )
+            "[D] " + self.corpus["passage"] if self.prepend_token else self.corpus["passage"]
+        ).tolist()
         pids = self.corpus["pid"].tolist()
         docs = []
         batches = get_batch_amount(corpus_size, BATCH_SIZE_LM_MODEL)
 
         for i in range(batches):
-            embs = self._get_batch_embeddings_by_forward_pass(
+            embs: np.ndarray = self._get_batch_embeddings_by_forward_pass(
                 passages[BATCH_SIZE_LM_MODEL * i : min(BATCH_SIZE_LM_MODEL * (i + 1), corpus_size)],
-            )
+            )  # type: ignore
             for j in range(embs.shape[0]):
                 emb = embs[j, :]
                 docs.append(
@@ -643,6 +638,8 @@ class CausalProber:
     def _init_indexed_faiss_doc_store(self):
         logging.info("Restoring document store with Faiss index...")
         self.doc_store = self._get_doc_store(self.index_name, load_from_saved_index=True)
+        if "ivf" in self.faiss_index_factory_str.lower():
+            self.doc_store.faiss_indexes[self.index_name].make_direct_map()
         logging.info("Document store with Faiss index restored.")
 
     def _index_probing_faiss_doc_store(self):
@@ -756,7 +753,7 @@ class CausalProber:
             doc_store = self._get_doc_store(
                 self.index_name_probing,
                 layer,
-                f"./cache/{self.index_name_probing}_layer_{layer}.pickle",
+                load_from_saved_index=True,
             )
             self.probing_doc_stores.append(doc_store)
         logging.info(
@@ -834,8 +831,8 @@ class CausalProber:
         self._cleanup_before_indexing(self.index_name_probing)
         self._init_corpus()
         passages = (
-            self.corpus["passage"].apply(lambda x: "[D] " + x if self.prepend_token else x).tolist()
-        )
+            "[D] " + self.corpus["passage"] if self.prepend_token else self.corpus["passage"]
+        ).tolist()
 
         iter_params = zip(
             range(AMOUNT_LAYERS),
@@ -860,7 +857,7 @@ class CausalProber:
             doc_store = self._get_doc_store(
                 self.index_name_probing,
                 layer,
-                f"./cache/{self.index_name_probing}_layer_{layer}.pickle",
+                load_from_saved_index=True,
             )
             self.probing_doc_stores.append(doc_store)
         logging.info(
@@ -947,14 +944,12 @@ class CausalProber:
         self._init_corpus()
         corpus_sample = self.corpus.sample(n=INDEX_TRAINING_SAMPLE_SIZE, random_state=SEED)  # type: ignore
         passages = (
-            self.corpus["passage"].apply(lambda x: "[D] " + x if self.prepend_token else x).tolist()
-        )
+            "[D] " + self.corpus["passage"] if self.prepend_token else self.corpus["passage"]
+        ).tolist()
         # for training index
         passages_sample = (
-            corpus_sample["passage"]
-            .apply(lambda x: "[D] " + x if self.prepend_token else x)
-            .tolist()
-        )
+            "[D] " + corpus_sample["passage"] if self.prepend_token else corpus_sample["passage"]
+        ).tolist()
 
         iter_params = zip(
             index_strs,
@@ -1005,7 +1000,7 @@ class CausalProber:
         logging.info(
             f"Adding new indices {self.probing_task} of altered embeddings (RLACE/INLP) to 2 document store for the last layer (average and token wise). "
         )
-        index_strs = ["average, token_wise"]
+        index_strs = ["average", "token_wise"]
         self._cleanup_before_indexing(self.index_name_probing, index_suffixes=index_strs)
 
         def get_altered_embs(embs, index_str):
@@ -1020,15 +1015,14 @@ class CausalProber:
         pids = self.corpus["pid"].tolist()
         corpus_sample = self.corpus.sample(n=INDEX_TRAINING_SAMPLE_SIZE, random_state=SEED)  # type: ignore
         passages = (
-            self.corpus["passage"].apply(lambda x: "[D] " + x if self.prepend_token else x).tolist()
-        )
+            "[D] " + self.corpus["passage"] if self.prepend_token else self.corpus["passage"]
+        ).tolist()
         corpus_size = len(passages)
         # for training index
         passages_sample = (
-            corpus_sample["passage"]
-            .apply(lambda x: "[D] " + x if self.prepend_token else x)
-            .tolist()
-        )
+            "[D] " + corpus_sample["passage"] if self.prepend_token else corpus_sample["passage"]
+        ).tolist()
+
         self.probing_doc_store_average = self._get_doc_store(
             self.index_name_probing,
             index_suffix="average",
@@ -1049,6 +1043,7 @@ class CausalProber:
                     BATCH_SIZE_LM_MODEL
                     * i : min(BATCH_SIZE_LM_MODEL * (i + 1), len(passages_sample))
                 ]
+                # TODO: fix average computation over zero embeddings
                 embs = self._get_batch_embeddings_by_forward_pass_for_layer(
                     batch, LAST_LAYER_IDX, return_numpy=False
                 )
@@ -1073,6 +1068,7 @@ class CausalProber:
             batch = passages[
                 BATCH_SIZE_LM_MODEL * i : min(BATCH_SIZE_LM_MODEL * (i + 1), corpus_size)
             ]
+            # TODO: fix average computation over zero embeddings
             embs = self._get_batch_embeddings_by_forward_pass_for_layer(
                 batch, LAST_LAYER_IDX, return_numpy=False
             )
@@ -1150,6 +1146,14 @@ class CausalProber:
 
         return es_service
 
+    @staticmethod
+    def _mean_pooling(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor):
+        token_embeddings = last_hidden_state
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        return sum_embeddings / sum_mask
+
     def _get_embedding_by_forward_pass(self, sequence: str) -> np.ndarray:
         X_sequence_tokenized = self.tokenizer(
             sequence,
@@ -1159,20 +1163,35 @@ class CausalProber:
             return_tensors="pt",
         ).to(self.device)
         outputs = self.model(**X_sequence_tokenized)
-        embeddings = outputs.last_hidden_state.detach().cpu().numpy()
-        return np.average(embeddings[:, 4:, :], axis=-2).flatten()
+        embeddings = self._mean_pooling(
+            outputs["last_hidden_state"][:, 4:, :], X_sequence_tokenized["attention_mask"][:, 4:]
+        )
+        return embeddings.detach().cpu().numpy()
 
     def _get_query_embedding(self, query: str) -> np.ndarray:
         query = "[Q] " + query if self.prepend_token else query
         return self._get_embedding_by_forward_pass(query)
+
+    def _get_query_embedding_pyserini(self, query: str) -> np.ndarray:
+        max_length = 36  # hardcode for now
+        inputs = self.tokenizer(
+            "[CLS] [Q] " + query + "[MASK]" * max_length,
+            max_length=max_length,
+            truncation=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).to(self.device)
+        outputs = self.model(**inputs)
+        embeddings = outputs.last_hidden_state.detach().cpu().numpy()
+        return np.average(embeddings[:, 4:, :], axis=-2).flatten()
 
     def _get_passage_embedding(self, passage: str) -> np.ndarray:
         passage = "[D] " + passage if self.prepend_token else passage
         return self._get_embedding_by_forward_pass(passage)
 
     def _get_batch_embeddings_by_forward_pass(
-        self, batch: list, return_numpy: bool = True
-    ) -> Union[np.ndarray, torch.Tensor]:
+        self, batch: list, layer: Optional[Union[int, bool]] = False, return_numpy: bool = True
+    ) -> Union[list[np.ndarray], list[torch.Tensor], np.ndarray, torch.Tensor]:
         X_batch_tokenized = self.tokenizer(
             batch,
             padding=True,
@@ -1181,11 +1200,29 @@ class CausalProber:
             return_tensors="pt",
         ).to(self.device)
         outputs = self.model(**X_batch_tokenized)
-        embeddings = outputs.last_hidden_state.detach().cpu()
-        if return_numpy:
-            return np.average(embeddings[:, 4:, :], axis=-2)
+        if isinstance(layer, int):
+            embeddings = self._mean_pooling(
+                outputs.hidden_states[layer][:, 4:, :], X_batch_tokenized["attention_mask"][:, 4:]
+            )
+        elif isinstance(layer, bool) and layer:
+            ret = []
+            for layer_nr in range(AMOUNT_LAYERS):
+                embeddings = self._mean_pooling(
+                    outputs.hidden_states[layer_nr][:, 4:, :],
+                    X_batch_tokenized["attention_mask"][:, 4:],
+                )
+                if return_numpy:
+                    ret.append(embeddings.detach().cpu().numpy())
+                else:
+                    ret.append(embeddings.detach().cpu())
+            return ret
         else:
-            return torch.mean(embeddings[:, 4:, :], dim=-2)
+            embeddings = self._mean_pooling(
+                outputs.last_hidden_state[:, 4:, :], X_batch_tokenized["attention_mask"][:, 4:]
+            )
+            if return_numpy:
+                return embeddings.detach().cpu().numpy()
+        return embeddings.detach().cpu()
 
     def _get_batch_embeddings_all_layers_by_forward_pass(
         self, batch: list, return_numpy: bool = True
@@ -1251,51 +1288,142 @@ class CausalProber:
             yield self._get_batch_embeddings_by_forward_pass_for_layer(batch, layer, return_numpy)
             i += 1
 
+
+    def _debug_embedding_score(self):
+        query = {
+            156493: "do goldfish grow"
+        }
+        documents = {
+            5203821: "D. Liberalism ............................................................................................................................................. 14. E. Constructivism ...................................................................................................................................... 19. F. The English School ...............................................................................................................................",
+            2928707: "Goldfish Only Grow to the Size of Their Enclosure. There is an element of truth to this, but it is not as innocent as it sounds and is related more to water quality than tank size. When properly cared for, goldfish will not stop growing. Most fishes are in fact what are known as indeterminate growers.",
+        }
+        flat_index_score_non_scaled = 37.02694
+        flat_index_score_non_scaled_pyserini = 52.790016
+        pyserini_index_score_non_scaled_true = 81.19456
+        p_emb_false = self._get_passage_embedding(documents[5203821]).flatten()
+        p_emb_true = self._get_passage_embedding(documents[2928707]).flatten()
+        q_emb = self._get_query_embedding(query[156493]).flatten()
+        q_emb_pyserini = self._get_query_embedding_pyserini(query[156493])
+
+        dot1 = np.dot(p_emb_false, q_emb)
+        dot2 = np.dot(p_emb_false, q_emb_pyserini)
+        dot3 = np.dot(p_emb_true, q_emb)
+        dot4 = np.dot(p_emb_true, q_emb_pyserini)
+
+        assert(math.isclose(flat_index_score_non_scaled, dot1, rel_tol=1e-4))
+        assert(math.isclose(flat_index_score_non_scaled_pyserini, dot2, rel_tol=1e-4))
+        assert(math.isclose(pyserini_index_score_non_scaled_true, dot3, rel_tol=1e-4))
+        assert(math.isclose(pyserini_index_score_non_scaled_true, dot4, rel_tol=1e-4))
+
+
     def _debug(self):
-        queries = get_queries(MSMARCO_TREC_20XX_TEST_QUERIES_PATH)
-        top1000 = get_top_1000_passages(MSMARCO_TEST_43_TOP_1000_PATH)
-        self._init_corpus()
+        queries = get_queries(MSMARCO_TREC_2019_TEST_QUERIES_PATH)
+        # top1000 = get_top_1000_passages(MSMARCO_TEST_43_TOP_1000_PATH)
+        # self._init_corpus()
+        predictions: dict[
+            str, dict[str, float]
+        ] = {}  # Query IDs mapped to document IDs mapped to scores.
+        predictions_2: dict[
+            str, dict[str, float]
+        ] = {}  # Query IDs mapped to document IDs mapped to scores.
+        predictions_3: dict[
+            str, dict[str, float]
+        ] = {}  # Query IDs mapped to document IDs mapped to scores.
 
         for i, row in queries.iterrows():
             qid, query = row[0], row[1]
-            try:
-                top1_relevant_pid = top1000[qid][0]
-                top1000_relevant_pids = top1000[qid]
-                pass
-            except:
-                continue
-            pass
+            # try:
+            #     top1_relevant_pid = top1000[qid][0]
+            #     top1000_relevant_pids = top1000[qid]
+            #     pass
+            # except:
+            #     continue
+            # pass
+
             # pyserini
-            if isinstance(self.doc_store, FaissSearcher):
-                relevant_docs = self.doc_store.search(row[1])
-                pass
-            elif isinstance(self.doc_store, FAISSDocumentStore):
-                q_emb_np = self._get_query_embedding(query)
+            query_emb = self._get_query_embedding(query)
+            query_emb_pyserini = self._get_query_embedding_pyserini(query)
+            y = self.doc_store_pyserini.search(query, k=1000)
+            yy = self.doc_store_pyserini.search(
+                query_emb_pyserini.reshape(1, len(query_emb_pyserini)), k=1000
+            )
+            yyy = self.doc_store_pyserini.search(query_emb, k=1000)
+            docs_dict = {doc.docid: doc.score for doc in y}
+            predictions[str(qid)] = docs_dict  # type: ignore
+            docs_dict = {doc.docid: doc.score for doc in yy}
+            predictions_2[str(qid)] = docs_dict  # type: ignore
+            docs_dict = {doc.docid: doc.score for doc in yyy}
+            predictions_3[str(qid)] = docs_dict  # type: ignore
+            pass
+
+        self._trec_eval(predictions, index_name="pyserini_1")
+        self._trec_eval(predictions_2, index_name="pyserini_2")
+        self._trec_eval(predictions_3, index_name="pyserini_3")
+        # if isinstance(self.doc_store, FaissSearcher):
+        #     relevant_docs = self.doc_store.search(row[1])
+        #     pass
+        # elif isinstance(self.doc_store, FAISSDocumentStore):
+        #     q_emb_np = self._get_query_embedding(query)
+        #     q_emb_pt = torch.from_numpy(q_emb_np).unsqueeze(0)
+        #     q_emb_probing_pt = q_emb_pt.mm(self.projection)
+        #     q_emb_probing_np = q_emb_probing_pt.squeeze(0).numpy()
+
+        #     relevant_docs = self.doc_store.query_by_embedding(
+        #         q_emb_np, index=self.index_name, top_k=1000, return_embedding=True
+        #     )
+        #     relevant_docs_probing = self.probing_doc_store.query_by_embedding(
+        #         q_emb_probing_np, index=self.index_name_probing, top_k=10, return_embedding=True
+        # )
+
+        # top1_relevant_doc = self.corpus[self.corpus["pid"] == top1_relevant_pid]
+        # passage = top1_relevant_doc["passage"].tolist()[0]
+        # p_emb_np = self._get_passage_embedding(passage)
+        # p_emb_pt = torch.from_numpy(p_emb_np)
+        # for j, doc in enumerate(relevant_docs):
+        #     if doc.meta["pid"] == top1_relevant_pid or doc.meta["pid"] == 8434617:
+        #         emb_from_doc_store_np = doc.embedding
+        #         emb_from_doc_store_pt = torch.from_numpy(emb_from_doc_store_np)
+        #         all_close = torch.allclose(p_emb_pt, emb_from_doc_store_pt, rtol=1e-04)
+        #         pass
+
+    def _evaluate(
+        self,
+        doc_store: FAISSDocumentStore,
+        index_name: str,
+        alter_query_emb: bool = False,
+        layer: Optional[int] = None,
+        index_suffix: Optional[str] = None,
+        recall_at: int = 1000,
+    ):
+        logging.info(f"Evaluating performance of {index_name}.")
+        logging.info(f"Number of docs in index: {doc_store.faiss_indexes[index_name].ntotal}")
+        queries = get_queries(MSMARCO_TREC_2019_TEST_QUERIES_PATH)
+        predictions: dict[
+            str, dict[str, float]
+        ] = {}  # Query IDs mapped to document IDs mapped to scores.
+
+        for i, row in queries.iterrows():
+            qid = row[0]
+            query = row[1]
+
+            # q_emb_np = self._get_query_embedding(query)
+            q_emb_np = self._get_query_embedding_pyserini(query)
+            if alter_query_emb:
                 q_emb_pt = torch.from_numpy(q_emb_np).unsqueeze(0)
-                q_emb_probing_pt = q_emb_pt.mm(self.projection)
-                q_emb_probing_np = q_emb_probing_pt.squeeze(0).numpy()
+                q_emb_np = q_emb_pt.mm(self.projection).squeeze(0).numpy()
 
-                relevant_docs = self.doc_store.query_by_embedding(
-                    q_emb_np, index=self.index_name, top_k=1000, return_embedding=True
-                )
-                relevant_docs_probing = self.probing_doc_store.query_by_embedding(
-                    q_emb_probing_np, index=self.index_name_probing, top_k=10, return_embedding=True
-                )
+            relevant_docs = doc_store.query_by_embedding(
+                q_emb_np, index=index_name, top_k=recall_at, return_embedding=True
+            )
 
-                top1_relevant_doc = self.corpus[self.corpus["pid"] == top1_relevant_pid]
-                passage = top1_relevant_doc["passage"].tolist()[0]
-                p_emb_np = self._get_passage_embedding(passage)
-                p_emb_pt = torch.from_numpy(p_emb_np)
-                for j, doc in enumerate(relevant_docs):
-                    if doc.meta["pid"] == top1_relevant_pid or doc.meta["pid"] == 8434617:
-                        emb_from_doc_store_np = doc.embedding
-                        emb_from_doc_store_pt = torch.from_numpy(emb_from_doc_store_np)
-                        all_close = torch.allclose(p_emb_pt, emb_from_doc_store_pt, rtol=1e-04)
-                        pass
+            docs_dict = {doc.id: doc.score for doc in relevant_docs}
+            predictions[str(qid)] = docs_dict  # type: ignore
+
+        self._trec_eval(predictions, index_name, layer, index_suffix)
 
     def _evaluate_performance_all_layers(self, recall_at: int = 1000):
         logging.info("Evaluating performance ...")
-        queries = get_queries(MSMARCO_TREC_20XX_TEST_QUERIES_PATH)
+        queries = get_queries(MSMARCO_TREC_2019_TEST_QUERIES_PATH)
 
         predictions: dict[
             str, dict[str, float]
@@ -1304,7 +1432,7 @@ class CausalProber:
             {} for _ in range(AMOUNT_LAYERS)
         ]  # list of Query IDs mapped to document IDs mapped to scores. (Ordered by layer number)
 
-        for i, row in tqdm(queries.iterrows(), desc="Evaluating"):
+        for i, row in queries.iterrows():
             qid = row[0]
             query = row[1]
 
@@ -1330,128 +1458,31 @@ class CausalProber:
                 docs_dict = {doc.id: doc.score for doc in relevant_docs_probing[layer]}
                 predictions_probing[layer][str(qid)] = docs_dict  # type: ignore
 
-        logging.info(f"Starting official TREC evaluation.")
-        timestamp = get_timestamp()
-        self._trec_eval(predictions, self.index_name, timestamp)
+        self._trec_eval(predictions, self.index_name)
         for layer in range(AMOUNT_LAYERS):
-            self._trec_eval(predictions_probing[layer], self.index_name_probing, timestamp, layer)
-        logging.info(f"Evaluation done." f"Logged results at time {timestamp}.")
-
-    def _evaluate_performance(self, mrr_at: int = 10, recall_at: int = 1000):
-        logging.info("Evaluating performance ...")
-        queries = get_queries(MSMARCO_TREC_20XX_TEST_QUERIES_PATH)
-
-        predictions: dict[
-            str, dict[str, float]
-        ] = {}  # Query IDs mapped to document IDs mapped to scores.
-        predictions_probing: dict[
-            str, dict[str, float]
-        ] = {}  # Query IDs mapped to document IDs mapped to scores.
-
-        for i, row in tqdm(queries.iterrows(), desc="Evaluating"):
-            qid = row[0]
-            query = row[1]
-
-            q_emb_np = self._get_query_embedding(query)
-            q_emb_pt = torch.from_numpy(q_emb_np).unsqueeze(0)
-            q_emb_probing_pt = q_emb_pt.mm(self.projection)
-            q_emb_probing_np = q_emb_probing_pt.squeeze(0).numpy()
-            relevant_docs = self.doc_store.query_by_embedding(
-                q_emb_np, index=self.index_name, top_k=recall_at, return_embedding=True
-            )
-            relevant_docs_probing = self.probing_doc_store.query_by_embedding(
-                q_emb_probing_np,
-                index=self.index_name_probing,
-                top_k=recall_at,
-                return_embedding=True,
-            )
-            docs_dict = {doc.id: doc.score for doc in relevant_docs}
-            predictions[str(qid)] = docs_dict  # type: ignore
-            docs_dict = {doc.id: doc.score for doc in relevant_docs_probing}
-            predictions_probing[str(qid)] = docs_dict  # type: ignore
-
-        logging.info(f"Starting official TREC evaluation.")
-        timestamp = get_timestamp()
-        self._trec_eval(predictions, self.index_name, timestamp)
-        self._trec_eval(predictions_probing, self.index_name_probing, timestamp)
-        logging.info(f"Evaluation done." f"Logged results at time {timestamp}.")
-
-    def _evaluate_ablation_last_layer(self, recall_at: int = 1000):
-        logging.info("Evaluating performance ...")
-        queries = get_queries(MSMARCO_TREC_20XX_TEST_QUERIES_PATH)
-
-        predictions_orig: dict[
-            str, dict[str, float]
-        ] = {}  # Query IDs mapped to document IDs mapped to scores.
-        predictions_probing_average: dict[
-            str, dict[str, float]
-        ] = {}  # Query IDs mapped to document IDs mapped to scores.
-        predictions_probing_token_wise: dict[
-            str, dict[str, float]
-        ] = {}  # Query IDs mapped to document IDs mapped to scores.
-
-        for i, row in tqdm(queries.iterrows(), desc="Evaluating"):
-            qid = row[0]
-            query = row[1]
-
-            q_emb_np = self._get_query_embedding(query)
-            q_emb_pt = torch.from_numpy(q_emb_np).unsqueeze(0)
-            q_emb_probing_pt = q_emb_pt.mm(self.projection)
-            q_emb_probing_np = q_emb_probing_pt.squeeze(0).numpy()
-            relevant_docs_probing_average = self.probing_doc_store_average.query_by_embedding(
-                q_emb_probing_np,
-                index=self.index_name_probing,
-                top_k=recall_at,
-                return_embedding=True,
-            )
-            relevant_docs = self.doc_store.query_by_embedding(
-                q_emb_np, index=self.index_name, top_k=recall_at, return_embedding=True
-            )
-            relevant_docs_probing_token_wise = self.probing_doc_store_token_wise.query_by_embedding(
-                q_emb_probing_np,
-                index=self.index_name_probing,
-                top_k=recall_at,
-                return_embedding=True,
-            )
-            docs_dict = {doc.id: doc.score for doc in relevant_docs}
-            predictions_orig[str(qid)] = docs_dict  # type: ignore
-            docs_dict = {doc.id: doc.score for doc in relevant_docs_probing_average}
-            predictions_probing_average[str(qid)] = docs_dict  # type: ignore
-            docs_dict = {doc.id: doc.score for doc in relevant_docs_probing_token_wise}
-            predictions_probing_token_wise[str(qid)] = docs_dict  # type: ignore
-
-        logging.info(f"Starting official TREC evaluation.")
-        timestamp = get_timestamp()
-        self._trec_eval(predictions_orig, self.index_name, timestamp)
-        self._trec_eval(
-            predictions_probing_average, self.index_name_probing, timestamp, index_suffix="average"
-        )
-        self._trec_eval(
-            predictions_probing_token_wise,
-            self.index_name_probing,
-            timestamp,
-            index_suffix="token_wise",
-        )
-        logging.info(f"Evaluation done." f"Logged results at time {timestamp}.")
+            self._trec_eval(predictions_probing[layer], self.index_name_probing, layer)
 
     def _trec_eval(
         self,
         predictions,
         index_name: str,
-        timestamp: str,
         layer: Optional[int] = None,
         index_suffix: Optional[str] = None,
     ):
         combined_str = f"{'_layer_{layer}' if isinstance(layer, int) else ''}{f'_{index_suffix}' if index_suffix else ''}"
-        out_file_str = f"./logs/results/trec_eval_{index_name}_{timestamp}{combined_str}.tsv"
+        logging.info(f"Starting official TREC evaluation of {index_name}{combined_str}.")
+        out_file_str = f"./logs/results/trec_eval_{index_name}_{self.timestamp}{combined_str}.tsv"
         eval_file_str = f"./logs/trec/trec_eval_{index_name}{combined_str}.tsv"
         out_file = Path(out_file_str)
         write_trec_eval_file(Path(eval_file_str), predictions, self.probing_task)
         trec_evaluation(
-            out_file, self.model_choice, MSMARCO_QREL_2019_PATH, TREC_EVAL, self.trec_eval_file, 0
+            out_file, self.model_choice, MSMARCO_QREL_2019_PATH, TREC_EVAL, eval_file_str, 0
         )
-        if out_file.is_file():
-            os.remove(out_file_str)
+        # if Path(eval_file_str).is_file():
+        #     os.remove(eval_file_str)
+        logging.info(
+            f"TREC evaluation of {index_name}{combined_str} done. Logged results at time {self.timestamp}."
+        )
 
 
 # Adversarial R-LACE
@@ -1502,4 +1533,5 @@ if __name__ == "__main__":
     root.setLevel(logging_level)
 
     args = vars(args)
-    CausalProber(**args)
+    cp = CausalProber(**args)
+    cp.run()
