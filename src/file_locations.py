@@ -1,12 +1,20 @@
 from pathlib import Path
 
+from src.probing_config import ProbingTask
+
 ## DATA
 DATASET_PATHS = {
-    "bm25": Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json"),
-    "sem_sim": Path("./datasets/msmarco_semantic_similarity.json"),
-    "something_else": Path("./datasets/msmarco_.json"),
-    
-} 
+    ProbingTask.BM25: Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json"),
+    ProbingTask.BM25_BUCKETIZED: Path("./datasets/msmarco_bm25_60000_10_2022_04_08-15-40-06.json"),
+    ProbingTask.SEM: Path("./datasets/msmarco_sem_sim_60000_10_2022_03_21-17-06-14.json"),
+    ProbingTask.SEM_BUCKETIZED: Path("./datasets/msmarco_sem_sim_60000_10_2022_03_21-17-06-14.json"),
+    ProbingTask.AVG_TI: Path("./datasets/msmarco_avg_term_importance_60000_10_2023_03_15-05-14-29.json"),
+    ProbingTask.AVG_TI_BUCKETIZED: Path("./datasets/msmarco_avg_term_importance_60000_10_2023_03_15-05-14-29.json"),
+    ProbingTask.TI: Path("./datasets/msmarco_term_importance_60000_10_2023_03_24-10-08-18.json"),
+    ProbingTask.TI_BUCKETIZED: Path("./datasets/msmarco_term_importance_60000_10_2023_03_24-10-08-18.json"),
+    ProbingTask.COREF: Path("./datasets/msmarco_coref_res_60000_10_2023_04_12-12-24-34.json"),
+    ProbingTask.NER: Path("./datasets/msmarco_ner_60000_10_2023_04_13-16-13-46.json"),
+}
 MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
 MSMARCO_DEV_QUERIES_PATH = Path("./assets/msmarco/queries.dev.tsv")
 MSMARCO_DEV_QRELS_PATH = Path("./assets/msmarco/qrels.dev.tsv")

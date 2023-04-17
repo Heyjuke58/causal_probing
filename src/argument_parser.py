@@ -1,5 +1,8 @@
 import argparse
 
+from src.probing_config import (MergingStrategy, ProbeModelType, ProbingTask,
+                                PropertyRemoval)
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -13,6 +16,7 @@ def parse_arguments():
     parser.add_argument("--debug", dest="debug", action="store_true")
     parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
     parser.add_argument("--ablation_last_layer", dest="ablation_last_layer", action="store_true")
+    parser.add_argument("--in_mem_doc_store", dest="in_mem_doc_store", action="store_true")
     parser.add_argument(
         "-m",
         "--model",
@@ -50,5 +54,93 @@ def parse_arguments():
 
     # assert sum(list(map(int, args.split.split(',')))) == 100, "Not a valid train/val/test split. Must add up to 100 like 70,15,15."
     # assert sum(list(map(int, args.neg_sample_ratio.split(',')))) == 100, "Not a valid negative sampling ratio of easy and hard examples. Must add up to 100 like 50,50."
+
+    return args
+
+
+def parse_arguments_intervention():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", dest="debug", action="store_true")
+    parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
+    parser.add_argument("--alter_query_embedding", dest="alter_query_embedding", action="store_true")
+    parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        dest="model_choice",
+        default="tct_colbert",
+        help="Model to run.",
+    )
+    parser.add_argument(
+        "-l",
+        "--layer",
+        type=int,
+        dest="layer",
+        default=None,
+        help="On which layer to intervene",
+    )
+    parser.add_argument(
+        "-a",
+        "--ablation",
+        type=str,
+        dest="ablation",
+        default=None,
+        help="Whether to apply an ablation. Choices: token_wise, reconstruct_property, control",
+    )
+    parser.add_argument(
+        "-t",
+        "--task",
+        type=ProbingTask,
+        dest="probing_task",
+        default=ProbingTask.BM25,
+        choices=list(ProbingTask),
+        help="Probing task to perform. In other words: Which property to remove.",
+    )
+    parser.add_argument(
+        "--probe_model_type",
+        type=ProbeModelType,
+        dest="probe_model_type",
+        default=ProbeModelType.LINEAR,
+        choices=list(ProbeModelType),
+        help="Which type of probe model to use.",
+    )
+    parser.add_argument(
+        "--property_removal",
+        type=PropertyRemoval,
+        dest="property_removal",
+        default=PropertyRemoval.RLACE,
+        choices=list(PropertyRemoval),
+        help="Which type of property removal algorithm to use.",
+    )
+    parser.add_argument(
+        "--merging_strategy",
+        type=MergingStrategy,
+        dest="merging_strategy",
+        default=MergingStrategy.AVERAGE,
+        choices=list(MergingStrategy),
+        help="Which type of strategy to use when merging query and passage embeddings.",
+    )
+
+    args = parser.parse_args()
+
+    return args
+
+
+def parse_arguments_reproducer():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", dest="debug", action="store_true")
+    parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
+    parser.add_argument("--reindex", dest="reindex", action="store_true")
+    # parser.add_argument("--in_mem_doc_store", dest="in_mem_doc_store", action="store_true")
+    parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        dest="model_choice",
+        default="tct_colbert",
+        help="Model to run.",
+    )
+
+    args = parser.parse_args()
 
     return args

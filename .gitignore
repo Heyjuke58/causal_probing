@@ -1,12 +1,13 @@
 .vscode/
 assets/
+datasets/
 cache/
 logs/
 src/X*
 faiss_document_store.db
 *.pickle
-submission.sub
-run_experiment.sh
+settings_htcondor/
+run_exp.sub
 notes.md
 
 # Byte-compiled / optimized / DLL files

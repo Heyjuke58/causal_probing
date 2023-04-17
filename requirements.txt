@@ -6,3 +6,9 @@ ftfy
 rank_bm25
 matplotlib
 pyserini
+seaborn
+unidecode
+spacy==2.1.9
+faiss-cpu
+nltk
+pytrec-eval

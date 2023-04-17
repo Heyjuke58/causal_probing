@@ -1,25 +1,19 @@
 import argparse
+import os
 import subprocess
 from pathlib import Path
-import os
-from typing import Dict, Any
+from typing import Any, Dict
 
 import pandas as pd
+import pytrec_eval
+import scipy.stats
 from ranking_utils import write_trec_eval_file
 from scipy import stats
-import scipy.stats
-import pytrec_eval
 
 
 def get_map_score(ifname, METRIC_TYPE, qrel_file, trec_eval_file):
     metric = 0.0
-    args = (
-        trec_eval_file
-        + " -m map -m recip_rank -m P.10,20 -m ndcg_cut.10,20 "
-        + qrel_file
-        + " "
-        + ifname
-    ).split()
+    args = (trec_eval_file + " -m map -m recip_rank -m P.10,20 -m ndcg_cut.10,20 -m recall.1000 " + qrel_file + " " + ifname).split()
 
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for line in p.stdout.readlines():
@@ -33,33 +27,16 @@ def get_map_score(ifname, METRIC_TYPE, qrel_file, trec_eval_file):
 
 # ToDo: get statistical significance score with other metrics
 def trec_evaluation(out_file, model_name, qrel_file, trec_eval_file, result_file, score):
-    fo = open(out_file, "a")
-    # fo.write('alpha' + '\t' + 'MAP' + '\t' + 'nDCG20' + '\t' + 'P20' + '\t' + 'RR' + '\t' + model_name + '\n')
-    MAP = get_map_score(result_file, "map", qrel_file, trec_eval_file)
-    NDCG_10 = get_map_score(result_file, "ndcg_cut_10", qrel_file, trec_eval_file)
-    NDCG = get_map_score(result_file, "ndcg_cut_20", qrel_file, trec_eval_file)
-    P10 = get_map_score(result_file, "P_10", qrel_file, trec_eval_file)
-    P20 = get_map_score(result_file, "P_20", qrel_file, trec_eval_file)
-    RR = get_map_score(result_file, "recip_rank", qrel_file, trec_eval_file)
-
-    s = (
-        str(model_name)
-        + "\t MAP: "
-        + str(MAP)
-        + "\t NDCG_10: "
-        + str(NDCG_10)
-        + "\t NDCG_20: "
-        + str(NDCG)
-        + "\t P_10: "
-        + str(P10)
-        + "\t P_20: "
-        + str(P20)
-        + "\t Reciprocal Rank: "
-        + str(RR)
-    )
-    print(s)
-    fo.write(s + "\n")
-    fo.close()
+    with open(out_file, "a") as fo:
+        MAP = get_map_score(result_file, "map", qrel_file, trec_eval_file)
+        NDCG_10 = get_map_score(result_file, "ndcg_cut_10", qrel_file, trec_eval_file)
+        NDCG = get_map_score(result_file, "ndcg_cut_20", qrel_file, trec_eval_file)
+        P10 = get_map_score(result_file, "P_10", qrel_file, trec_eval_file)
+        P20 = get_map_score(result_file, "P_20", qrel_file, trec_eval_file)
+        RR = get_map_score(result_file, "recip_rank", qrel_file, trec_eval_file)
+        recall_1000 = get_map_score(result_file, "recall_1000", qrel_file, trec_eval_file)
+        fo.write(f"MAP\tNDCG@10\tNDCG@20\tP@10\tP@20\tReciprocal Rank\tRecall@1000\n")
+        fo.write(f"{MAP:.3f}\t{NDCG_10:.3f}\t{NDCG:.3f}\t{P10:.3f}\t{P20:.3f}\t{RR:.3f}\t{recall_1000:.3f}\n")
 
 
 def statistical_significance(qrel_file, file_1, file_2, metric):
@@ -124,14 +101,10 @@ class TrecEvaluation:
         # statistical Significance Test
         if test_trecdl_20:
             print("Significance computed with(baseline):{}".format(self.stat_sig_base_path))
-            score = statistical_significance(
-                self.qrel_file_20, self.stat_sig_base_path_20, result_file, "map"
-            )
+            score = statistical_significance(self.qrel_file_20, self.stat_sig_base_path_20, result_file, "map")
         else:
             print("Significance computed with(baseline):{}".format(self.stat_sig_base_path))
-            score = statistical_significance(
-                self.qrel_file, self.stat_sig_base_path, result_file, "map"
-            )
+            score = statistical_significance(self.qrel_file, self.stat_sig_base_path, result_file, "map")
 
         # For trec evaluation
         out_file = self.save_dir + "/" + out_file_name
@@ -151,9 +124,7 @@ def stattistical_ttest_rel(base_file, final_file):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument(
-        "--save_dir", default="out", help="Directory for logs, checkpoints and predictions"
-    )
+    ap.add_argument("--save_dir", default="out", help="Directory for logs, checkpoints and predictions")
     ap.add_argument("--test_name", type=str, default="", help="Name of the test")
     ap.add_argument("--test_trecdl_20", action="store_true", help="Set True for TRECDL-20 test")
     ap.add_argument(
@@ -165,7 +136,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "--qrel_file_20",
         type=str,
-        default="/home/aanand/qrels/2020-qrels-doc.txt",
+        default="/home/hinrichs/causal_probing/assets/msmarco/2020-qrels-doc.txt",
         help="Path to 2020 qrel file",
     )
     ap.add_argument(
@@ -174,9 +145,7 @@ if __name__ == "__main__":
         default="/home/hinrichs/causal_probing/trec_eval",
         help="Path to trec evalation script",
     )
-    ap.add_argument(
-        "--version_num", type=str, default="version_0", help="Version to calculate results"
-    )
+    ap.add_argument("--version_num", type=str, default="version_0", help="Version to calculate results")
     ap.add_argument(
         "--stat_sig_base_path",
         type=str,
