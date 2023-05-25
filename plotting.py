@@ -1,10 +1,9 @@
 import argparse
 import itertools
-import logging
 from collections import defaultdict
 from pathlib import Path
 from textwrap import wrap
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 import matplotlib.pylab as pylab
 import matplotlib.pyplot as plt
@@ -321,44 +320,6 @@ def plot_single_behavior_bar(df, task: ProbingTask, metric: str):
 
     plt.subplots_adjust(bottom=0.14, left=0.075, right=0.8)
     fig.savefig(f"./plots/{task}_behaviour_barplot_{metric}.png", dpi=300)
-
-
-# def plot_behavior(df, baseline: float, task: ProbingTask):
-#     standard_kwargs_sns = {
-#         "markers": MARKER_STYLES,
-#         "markersize": 10,
-#         "style": "exp",
-#         "dashes": False,
-#         "palette": "colorblind",
-#     }
-#     standard_kwargs_sns_scatter = {
-#         "markers": MARKER_STYLES,
-#         "s": 100,
-#         "style": "exp",
-#         "alpha": 0.8,
-#         "palette": "colorblind",
-#     }
-#     kwargs_baseline = {
-#         "label": "no intervention",
-#         "color": "grey",
-#         "linestyle": "dashed",
-#     }
-#     fig = plt.gcf()
-#     fig.set_size_inches(8, 5)
-#     fig.tight_layout()
-#     plt.xticks(LAYERS)
-#     plt.ylabel("NDCG@10")
-#     plt.xlabel("Layer")
-#     plt.grid()
-#     plt.ylim(0.2, 0.75)
-#     # plt.subplots_adjust(bottom=0.17)
-
-#     # sns.lineplot(data=df, x="layer", y="ndcg_10", hue="exp", **standard_kwargs_sns)
-#     sns.scatterplot(data=df, x="layer", y="ndcg_10", hue="exp", **standard_kwargs_sns_scatter)
-#     # sns.barplot(data=df, x="layer", y="ndcg_10", hue="exp", width=0.7)
-#     plt.plot(LAYERS, [baseline for _ in range(AMOUNT_LAYERS)], **kwargs_baseline)
-#     plt.legend(title="experiment", loc="lower left")
-#     fig.savefig(f"./plots/{task}_behaviour_scatterplot.png", dpi=300)
 
 
 def plot_subspace(df, maj_acc, task: ProbingTask):

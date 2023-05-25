@@ -8,7 +8,6 @@ import torch
 from ranking_utils import write_trec_eval_file
 
 from src.file_locations import MSMARCO_QREL_2019_PATH, MSMARCO_TREC_2019_TEST_QUERIES_PATH, TREC_EVAL
-from src.hyperparameter import LAST_LAYER_IDX
 from src.model import ModelWrapper
 from src.probing_config import ProbingTask
 from src.trec_evaluation import trec_evaluation

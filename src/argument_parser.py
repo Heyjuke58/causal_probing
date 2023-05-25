@@ -1,6 +1,6 @@
 import argparse
 
-from src.probing_config import MergingStrategy, ProbeModelType, ProbingTask, PropertyRemoval
+from src.probing_config import ProbeModelType, ProbingTask
 
 
 def parse_arguments_intervention():
@@ -8,7 +8,6 @@ def parse_arguments_intervention():
     parser.add_argument("--debug", dest="debug", action="store_true")
     parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
     parser.add_argument("--alter_query_embedding", dest="alter_query_embedding", action="store_true")
-    parser.add_argument("--simple_projection", dest="simple_projection", action="store_true")
     parser.add_argument("--reconstruction_both", dest="reconstruction_both", action="store_true")
     parser.add_argument("--control_only", dest="control_only", action="store_true")
     parser.add_argument("--multiple_runs", dest="multiple_runs", action="store_true")
@@ -61,22 +60,6 @@ def parse_arguments_intervention():
         choices=list(ProbeModelType),
         help="Which type of probe model to use.",
     )
-    parser.add_argument(
-        "--property_removal",
-        type=PropertyRemoval,
-        dest="property_removal",
-        default=PropertyRemoval.RLACE,
-        choices=list(PropertyRemoval),
-        help="Which type of property removal algorithm to use.",
-    )
-    parser.add_argument(
-        "--merging_strategy",
-        type=MergingStrategy,
-        dest="merging_strategy",
-        default=MergingStrategy.AVERAGE,
-        choices=list(MergingStrategy),
-        help="Which type of strategy to use when merging query and passage embeddings.",
-    )
 
     args = parser.parse_args()
 
@@ -88,7 +71,6 @@ def parse_arguments_reproducer():
     parser.add_argument("--debug", dest="debug", action="store_true")
     parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
     parser.add_argument("--reindex", dest="reindex", action="store_true")
-    # parser.add_argument("--in_mem_doc_store", dest="in_mem_doc_store", action="store_true")
     parser.add_argument(
         "-m",
         "--model",

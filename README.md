@@ -1,6 +1,11 @@
 # Causal Probing
 
-## Setup
+This project contains the code of my [masters thesis](Deconstructing_Retrieval_Abilities_of_LMs.pdf).
+
+Results of causally probing TCT-ColBERT
+![](plots/all_behaviour_heatmap_ndcg_10_shortened.png)
+
+## Project Setup
 
 Setup Conda environment
 
@@ -41,8 +46,26 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-Run minimal example
+## Run Causal Probing
+
+Example: Causally probe subject model for task BM25 with intervention at layer 12. The intervention eliminates a subspace of rank 1.
 
 ```
-CUDA_VISIBLE_DEVICES=x,y python src/minimal_example.py
+python apply_intervention.py --layer=12 --eliminated_subspace_rank=1 --task=bm25 --model=tct_colbert
+```
+
+## Run Feasibility Study (Sanity Check)
+
+Example: Sanity check experiment for task NER with intervention at layer 12. The intervention eliminates a subspace of rank 8.
+
+```
+python apply_intervention.py --layer=12 --eliminated_subspace_rank=8 --task=ner --model=tct_colbert --ablation=reconstruct_property
+```
+
+## Run Feasibility Study (Eliminating Subspace of Increasing Ranks)
+
+Example: Subspace experiment for task NER with intervention at layer 12.
+
+```
+python apply_intervention.py --layer=12 --task=ner --model=tct_colbert --ablation=subspace_rank
 ```
