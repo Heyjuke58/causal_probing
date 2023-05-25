@@ -9,7 +9,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.linear_model import Ridge, SGDClassifier, SGDRegressor
+from sklearn.linear_model import Ridge, SGDClassifier
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.preprocessing import Normalizer, StandardScaler
 from unidecode import unidecode
@@ -26,7 +26,6 @@ from src.hyperparameter import (
     PROBE_MODEL_RUNS,
     RERUNS,
     SEED,
-    SUBSPACE_RANK,
 )
 from src.model import ModelWrapper
 from src.nlp_utils import (
@@ -39,7 +38,7 @@ from src.nlp_utils import (
     retokenize_spans,
 )
 from src.probe import TenneyMLP
-from src.probing_config import MergingStrategy, ProbeModelType, ProbingConfig, ProbingTask, PropertyRemoval
+from src.probing_config import ProbeModelType, ProbingConfig, ProbingTask
 from src.rlace import solve_adv_game
 from src.utils import get_batch_amount
 
@@ -76,10 +75,6 @@ class Prober:
             ProbingTask.QC_COARSE: partial(self.rlace, rank=config.rank_subspace),
             ProbingTask.QC_FINE: self.rlace,
         }
-        self.TASKS_INLP = {
-            ProbingTask.BM25: lambda x: x,
-            ProbingTask.SEM: lambda x: x,
-        }
         self.config: ProbingConfig = config
         self.model_wrapper = model_wrapper
         self.device = device
@@ -90,7 +85,7 @@ class Prober:
         self.train, self.test = self._train_test_split()
         layer_str = f"_layer_{self.config.layer}" if type(self.config.layer) == int else ""
         self.normalize_str = f"_normalized_target" if self.config.normalize_target else ""
-        self.identification_str = f"{self.config.probing_task}_{self.config.merging_strategy}{layer_str}"
+        self.identification_str = f"{self.config.probing_task}{layer_str}"
         self.logs_dir = "./logs/results/"
         self.debug = debug
         self.reconstruction_both = reconstruction_both
@@ -102,18 +97,10 @@ class Prober:
         self.X_train, self.y_train, self.X_test, self.y_test = self.DATA_PREPROCESSING[self.config.probing_task]()
         self.num_classes = torch.unique(self.y_train).shape[0]
 
-        if self.config.property_removal == PropertyRemoval.RLACE:
-            if self.debug:
-                self.projection = torch.rand((EMBEDDING_SIZE, EMBEDDING_SIZE)).to(self.device)
-            else:
-                self.projection = self.TASKS_RLACE[self.config.probing_task](self.X_train, self.y_train, self.X_test, self.y_test).to(
-                    self.device
-                )
-        # Not yet implemented
-        elif self.config.property_removal == PropertyRemoval.INLP:
-            self.projection = self.TASKS_INLP[self.config.probing_task](self.X_train, self.y_train, self.X_test, self.y_test).to(self.device)
+        if self.debug:
+            self.projection = torch.rand((EMBEDDING_SIZE, EMBEDDING_SIZE)).to(self.device)
         else:
-            raise NotImplementedError(f"Property removal algorithm {self.config.property_removal} not implemented.")
+            self.projection = self.TASKS_RLACE[self.config.probing_task](self.X_train, self.y_train, self.X_test, self.y_test).to(self.device)
 
     def rlace(self, X: torch.Tensor, y, X_test, y_test, rank: int = 1, subspace_ablation: bool = False, out_iters: int = 50000):
         if self.debug:
@@ -605,13 +592,6 @@ class Prober:
             if not token.isalnum() and not token.startswith("##"):
                 cur_token = ""
                 continue
-            # if (token in STOPWORDS and not term.startswith(token)) or (not token.isalnum() and not token.startswith("##")):
-            #     if token[:-1] == term:  # isn't, aren't, couldn't, ...
-            #         resulting_indices.append(i + 4)
-            #         break
-            #     else:
-            #         cur_token = ""
-            #         continue
 
             cur_token = cur_token + token if not token.startswith("##") else cur_token + token[2:]
             next_token = tokens[4:][i + 1] if not i == len(tokens[4:]) - 1 else ""
@@ -988,19 +968,9 @@ class Prober:
         if self.config.probe_model_type == ProbeModelType.LINEAR:
             reg_kwargs = {"random_state": seed, "solver": "svd"}
             reg_model = Ridge
-            # reg_kwargs = {"random_state": seed, "max_iter": 3000, "early_stopping": True}
-            # reg_model = SGDRegressor
         elif self.config.probe_model_type == ProbeModelType.MLP:
             reg_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 300, "random_state": seed, "early_stopping": True}
             reg_model = MLPRegressor
-            # reg_kwargs = {
-            #     "input_dim": EMBEDDING_SIZE,
-            #     "hidden_dim": 256,
-            #     "output_dim": 1,
-            #     "dropout": 0.3,
-            #     "learning_rate": INITIAL_LR,
-            # }
-            # reg_model = TenneyMLP
         else:
             raise NotImplementedError(f"Reconstruction of property not implemented for {self.config.probe_model_type} model type.")
         return reg_model, reg_kwargs

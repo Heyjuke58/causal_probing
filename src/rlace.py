@@ -1,4 +1,3 @@
-import random
 import time
 
 import numpy as np
@@ -6,7 +5,7 @@ import sklearn
 import torch
 import tqdm
 from sklearn.linear_model import SGDClassifier
-from torch.optim import SGD, Adam
+from torch.optim import SGD
 
 EVAL_CLF_PARAMS = {"loss": "log_loss", "tol": 1e-4, "iters_no_change": 15, "alpha": 1e-4, "max_iter": 25000}
 NUM_CLFS_IN_EVAL = 3  # change to 1 for large dataset / high dimensionality

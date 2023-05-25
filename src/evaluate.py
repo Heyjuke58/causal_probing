@@ -18,7 +18,6 @@ def evaluate(
     model_wrapper: ModelWrapper,
     faiss_index: faiss.Index,
     timestamp: str,
-    alter_query_embedding: bool = False,
     layer: Optional[int] = None,
     probing_task: Optional[ProbingTask] = None,
     eval_str: str = "",
@@ -33,16 +32,7 @@ def evaluate(
     for i, row in queries.iterrows():
         qid = row[0]
         query = row[1]
-        if (
-            (alter_query_embedding or probing_task in {ProbingTask.QC_COARSE, ProbingTask.QC_FINE})
-            and isinstance(layer, int)
-            and isinstance(projection, torch.Tensor)
-        ):
-            q_emb_np = model_wrapper.get_query_embeddings_pyserini_with_intervention_at_layer([query], projection, layer)
-        else:
-            q_emb_np = model_wrapper.get_query_embedding_pyserini(query)
-            q_emb_np = q_emb_np.reshape(1, q_emb_np.shape[0])
-
+        q_emb_np = model_wrapper.get_query_embeddings_pyserini_with_intervention_at_layer([query], projection, layer)
         scores, ids = faiss_index.search(q_emb_np, recall_at)
 
         docs_dict = {id: score for score, id in zip(scores[0].tolist(), ids[0].tolist())}

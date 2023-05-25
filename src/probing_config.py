@@ -21,23 +21,6 @@ class ProbingTask(Enum):
         return self.value
 
 
-class PropertyRemoval(Enum):
-    RLACE = "rlace"
-    INLP = "inlp"
-
-    def __str__(self) -> str:
-        return self.value
-
-
-class MergingStrategy(Enum):
-    AVERAGE = "average"
-    CONCAT = "concat"
-    MULTIPLY_ELEMENTWISE = "multiply_elementwise"
-
-    def __str__(self) -> str:
-        return self.value
-
-
 class ProbeModelType(Enum):
     LINEAR = "linear"
     MLP = "mlp"
@@ -49,8 +32,6 @@ class ProbeModelType(Enum):
 @dataclass
 class ProbingConfig:
     probing_task: ProbingTask
-    property_removal: PropertyRemoval
-    merging_strategy: MergingStrategy
     probe_model_type: ProbeModelType
     layer: Optional[int]
     rank_subspace: int
