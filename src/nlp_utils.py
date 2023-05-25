@@ -159,6 +159,8 @@ def preprocess(
     return x
 
 
+PUNCTUATIONS = ["'", '"', ",", ".", "!", "?", ";", ":", "(", ")", "[", "]", "{", "}", "-", "--", "...", "``", "''", "’", "‘"]
+
 ## SPACY TOKENIZER EXCEPTIONS
 TOKENIZER_EXCEPTIONS = {
     # do
@@ -219,6 +221,14 @@ TOKENIZER_EXCEPTIONS = {
     "Shalln't": [{ORTH: "Shalln", LEMMA: "shall"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
     "shalln’t": [{ORTH: "shalln", LEMMA: "shall"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
     "Shalln’t": [{ORTH: "Shalln", LEMMA: "shall"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "needn't": [{ORTH: "needn", LEMMA: "need"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "Needn't": [{ORTH: "Needn", LEMMA: "need"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "needn’t": [{ORTH: "needn", LEMMA: "need"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "Needn’t": [{ORTH: "Needn", LEMMA: "need"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "mightn't": [{ORTH: "mightn", LEMMA: "might"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "Mighn't": [{ORTH: "Mightn", LEMMA: "might"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "mightn’t": [{ORTH: "mightn", LEMMA: "might"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "Mightn’t": [{ORTH: "Mightn", LEMMA: "might"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
     # be
     "Im": [{ORTH: "Im"}],
     "im": [{ORTH: "im"}],
@@ -240,6 +250,10 @@ TOKENIZER_EXCEPTIONS = {
     "Aren't": [{ORTH: "Aren", LEMMA: "be"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
     "aren’t": [{ORTH: "aren", LEMMA: "be"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
     "Aren’t": [{ORTH: "Aren", LEMMA: "be"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "ain't": [{ORTH: "ain", LEMMA: "be"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "Ain't": [{ORTH: "Ain", LEMMA: "be"}, {ORTH: "'t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "ain’t": [{ORTH: "ain", LEMMA: "be"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
+    "Ain’t": [{ORTH: "Ain", LEMMA: "be"}, {ORTH: "’t", LEMMA: "not", NORM: "not", TAG: "RB"}],
     # degree C or F
     "°C": [{ORTH: "°C"}],
     "°c": [{ORTH: "°c"}],
@@ -271,7 +285,7 @@ def get_spacy_tokenizer():
     return tokenizer
 
 
-def get_spacy_pipeline():
+def get_spacy_pipeline_with_neuralcoref():
     if not spacy.util.is_package("en_core_web_sm"):
         spacy.cli.download("en_core_web_sm-2.1.0", direct=True)
 
@@ -279,6 +293,20 @@ def get_spacy_pipeline():
 
     nlp = en_core_web_sm.load()
     neuralcoref.add_to_pipe(nlp)
+
+    for key, val in TOKENIZER_EXCEPTIONS.items():
+        nlp.tokenizer.add_special_case(key, val)
+
+    return nlp
+
+
+def get_spacy_pipeline():
+    if not spacy.util.is_package("en_core_web_sm"):
+        spacy.cli.download("en_core_web_sm-2.1.0", direct=True)
+
+    import en_core_web_sm
+
+    nlp = en_core_web_sm.load()
 
     for key, val in TOKENIZER_EXCEPTIONS.items():
         nlp.tokenizer.add_special_case(key, val)

@@ -13,7 +13,6 @@ NUM_CLFS_IN_EVAL = 3  # change to 1 for large dataset / high dimensionality
 
 
 def init_classifier():
-
     return SGDClassifier(
         loss=EVAL_CLF_PARAMS["loss"],
         fit_intercept=True,
@@ -61,11 +60,9 @@ def solve_constraint(lambdas, d=1):
     iters = 0
 
     while iters < 25:
-
         mid = (theta_min + theta_max) / 2
 
         if f(mid) * f(theta_min) > 0:
-
             theta_min = mid
         else:
             theta_max = mid
@@ -78,9 +75,9 @@ def solve_constraint(lambdas, d=1):
 
 
 def get_majority_acc(y):
-
     from collections import Counter
 
+    y = y.tolist()
     c = Counter(y)
     fracts = [v / sum(c.values()) for v in c.values()]
     maj = max(fracts)
@@ -88,11 +85,11 @@ def get_majority_acc(y):
 
 
 def get_entropy(y):
-
     from collections import Counter
 
     import scipy
 
+    y = y.tolist()
     c = Counter(y)
     fracts = [v / sum(c.values()) for v in c.values()]
     return scipy.stats.entropy(fracts)
@@ -180,7 +177,6 @@ def solve_adv_game(
     best_P, best_score, best_loss = None, 1, -1
 
     for i in pbar:
-
         for j in range(in_iters_adv):
             P = symmetric(P)
             optimizer_P.zero_grad()
@@ -242,7 +238,6 @@ def solve_adv_game(
 
 
 if __name__ == "__main__":
-
     # random.seed(0)
     # np.random.seed(0)
 

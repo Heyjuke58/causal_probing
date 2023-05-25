@@ -14,7 +14,8 @@ class ProbingTask(Enum):
     TI_BUCKETIZED = "ti_bucketized"  # Term Importance Bucketized
     COREF = "coref"  # Coreference Resolution
     NER = "ner"  # Named Entity Recognition
-    QC = "qc"  # Question Classification
+    QC_COARSE = "qc_coarse"  # Question Classification coarse-grained
+    QC_FINE = "qc_fine"  # Question Classification fine-grained
 
     def __str__(self) -> str:
         return self.value
@@ -52,4 +53,5 @@ class ProbingConfig:
     merging_strategy: MergingStrategy
     probe_model_type: ProbeModelType
     layer: Optional[int]
+    rank_subspace: int
     normalize_target: bool

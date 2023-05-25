@@ -1,61 +1,6 @@
 import argparse
 
-from src.probing_config import (MergingStrategy, ProbeModelType, ProbingTask,
-                                PropertyRemoval)
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-ro", "--reindex_original", dest="reindex_original", action="store_true")
-    parser.add_argument("-rt", "--reindex_task", dest="reindex_task", action="store_true")
-    parser.add_argument("--do_not_prepend_token", dest="prepend_token", action="store_false")
-    parser.add_argument("-c", "--chunked_read_in", dest="chunked_read_in", action="store_true")
-    parser.add_argument("--generate_emb_chunks", dest="generate_emb_chunks", action="store_true")
-    parser.add_argument("-es", "--init_elastic_search", dest="init_elastic_search", action="store_true")
-    parser.add_argument("--all_layers", dest="all_layers", action="store_true")
-    parser.add_argument("--debug", dest="debug", action="store_true")
-    parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
-    parser.add_argument("--ablation_last_layer", dest="ablation_last_layer", action="store_true")
-    parser.add_argument("--in_mem_doc_store", dest="in_mem_doc_store", action="store_true")
-    parser.add_argument(
-        "-m",
-        "--model",
-        type=str,
-        dest="model_choice",
-        default="tct_colbert",
-        help="Model to run.",
-    )
-    parser.add_argument(
-        "-t",
-        "--task",
-        type=str,
-        dest="probing_task",
-        default="bm25",
-        help="Task to run. Possible tasks are: bm25, to be continued.",
-    )
-    parser.add_argument(
-        "-i",
-        "--index_str",
-        type=str,
-        dest="faiss_index_factory_str",
-        default="IVF30000,Flat",
-        help="Faiss index factory string. See https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index for more details.",
-    )
-    parser.add_argument(
-        "-f",
-        "--doc_store_framework",
-        type=str,
-        dest="doc_store_framework",
-        default="haystack",
-        help="Framewokr to build document store.",
-    )
-
-    args = parser.parse_args()
-
-    # assert sum(list(map(int, args.split.split(',')))) == 100, "Not a valid train/val/test split. Must add up to 100 like 70,15,15."
-    # assert sum(list(map(int, args.neg_sample_ratio.split(',')))) == 100, "Not a valid negative sampling ratio of easy and hard examples. Must add up to 100 like 50,50."
-
-    return args
+from src.probing_config import MergingStrategy, ProbeModelType, ProbingTask, PropertyRemoval
 
 
 def parse_arguments_intervention():
@@ -63,6 +8,10 @@ def parse_arguments_intervention():
     parser.add_argument("--debug", dest="debug", action="store_true")
     parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
     parser.add_argument("--alter_query_embedding", dest="alter_query_embedding", action="store_true")
+    parser.add_argument("--simple_projection", dest="simple_projection", action="store_true")
+    parser.add_argument("--reconstruction_both", dest="reconstruction_both", action="store_true")
+    parser.add_argument("--control_only", dest="control_only", action="store_true")
+    parser.add_argument("--multiple_runs", dest="multiple_runs", action="store_true")
     parser.add_argument(
         "-m",
         "--model",
@@ -78,6 +27,14 @@ def parse_arguments_intervention():
         dest="layer",
         default=None,
         help="On which layer to intervene",
+    )
+    parser.add_argument(
+        "-r",
+        "--eliminated_subspace_rank",
+        type=int,
+        dest="eliminated_subspace_rank",
+        default=1,
+        help="rank of the eliminated subspace by rlace",
     )
     parser.add_argument(
         "-a",

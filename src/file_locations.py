@@ -14,6 +14,8 @@ DATASET_PATHS = {
     ProbingTask.TI_BUCKETIZED: Path("./datasets/msmarco_term_importance_60000_10_2023_03_24-10-08-18.json"),
     ProbingTask.COREF: Path("./datasets/msmarco_coref_res_60000_10_2023_04_12-12-24-34.json"),
     ProbingTask.NER: Path("./datasets/msmarco_ner_60000_10_2023_04_13-16-13-46.json"),
+    ProbingTask.QC_COARSE: Path("./datasets/qc.tsv"),
+    ProbingTask.QC_FINE: Path("./datasets/qc.tsv"),
 }
 MSMARCO_CORPUS_PATH = Path("./assets/msmarco/collection.tsv")
 MSMARCO_DEV_QUERIES_PATH = Path("./assets/msmarco/queries.dev.tsv")

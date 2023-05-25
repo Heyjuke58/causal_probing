@@ -34,8 +34,11 @@ def evaluate(
     for i, row in queries.iterrows():
         qid = row[0]
         query = row[1]
-
-        if alter_query_embedding and isinstance(layer, int) and isinstance(projection, torch.Tensor):
+        if (
+            (alter_query_embedding or probing_task in {ProbingTask.QC_COARSE, ProbingTask.QC_FINE})
+            and isinstance(layer, int)
+            and isinstance(projection, torch.Tensor)
+        ):
             q_emb_np = model_wrapper.get_query_embeddings_pyserini_with_intervention_at_layer([query], projection, layer)
         else:
             q_emb_np = model_wrapper.get_query_embedding_pyserini(query)
@@ -47,7 +50,7 @@ def evaluate(
         predictions[str(qid)] = docs_dict  # type: ignore
 
     logging.info(f"Starting official TREC evaluation of {eval_str}.")
-    out_file_str = f"./logs/results/behavior{'/' + str(probing_task) if probing_task else ''}/trec_eval_{eval_str}_{timestamp}.tsv"
+    out_file_str = f"./logs/results/behavior{'/' + str(probing_task) if probing_task else '/control'}/trec_eval_{eval_str}_{timestamp}.tsv"
     eval_file_str = f"./logs/trec/trec_eval.tsv"
     out_file = Path(out_file_str)
     write_trec_eval_file(Path(eval_file_str), predictions, eval_str)

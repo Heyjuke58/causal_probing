@@ -14,9 +14,20 @@ from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.preprocessing import Normalizer, StandardScaler
 from unidecode import unidecode
 
-from src.amnesic_probing import create_rand_dir_projection
+from src.amnesic_probing import create_rand_dir_from_orth_basis_projection, create_rand_dir_projection
 from src.file_locations import DATASET_PATHS
-from src.hyperparameter import BATCH_SIZE_LM_MODEL, EMBEDDING_SIZE, NUM_BUCKETS_CLASSIFICATION, PROBE_MODEL_RUNS, SEED, SUBSPACE_RANK
+from src.hyperparameter import (
+    BATCH_SIZE_LM_MODEL,
+    BATCH_SIZE_PROBING_MODEL,
+    EMBEDDING_SIZE,
+    EPOCHS,
+    INITIAL_LR,
+    NUM_BUCKETS_CLASSIFICATION,
+    PROBE_MODEL_RUNS,
+    RERUNS,
+    SEED,
+    SUBSPACE_RANK,
+)
 from src.model import ModelWrapper
 from src.nlp_utils import (
     STOPWORDS,
@@ -27,13 +38,16 @@ from src.nlp_utils import (
     retokenize_span,
     retokenize_spans,
 )
+from src.probe import TenneyMLP
 from src.probing_config import MergingStrategy, ProbeModelType, ProbingConfig, ProbingTask, PropertyRemoval
 from src.rlace import solve_adv_game
 from src.utils import get_batch_amount
 
 
 class Prober:
-    def __init__(self, config: ProbingConfig, model_wrapper: ModelWrapper, device, debug: bool = False) -> None:
+    def __init__(
+        self, config: ProbingConfig, model_wrapper: ModelWrapper, device, debug: bool = False, reconstruction_both: bool = False
+    ) -> None:
         self.DATA_PREPROCESSING: dict[ProbingTask, Callable] = {
             ProbingTask.BM25: self._data_preprocessing_regression_task,
             ProbingTask.SEM: self._data_preprocessing_regression_task,
@@ -45,7 +59,8 @@ class Prober:
             ProbingTask.TI_BUCKETIZED: partial(self._data_preprocessing_bucketized_task_ti, num_buckets=NUM_BUCKETS_CLASSIFICATION),
             ProbingTask.COREF: self._data_preprocessing_coref,
             ProbingTask.NER: self._data_preprocessing_ner,
-            ProbingTask.QC: self._data_preprocessing_qc,
+            ProbingTask.QC_COARSE: self._data_preprocessing_qc,
+            ProbingTask.QC_FINE: partial(self._data_preprocessing_qc, fine_grained=True),
         }
         self.TASKS_RLACE: dict[ProbingTask, Callable] = {
             ProbingTask.BM25: self.rlace_linear_regression_closed_form,
@@ -57,8 +72,9 @@ class Prober:
             ProbingTask.AVG_TI_BUCKETIZED: self.rlace,
             ProbingTask.TI_BUCKETIZED: self.rlace,
             ProbingTask.COREF: self.rlace,
-            ProbingTask.NER: self.rlace,
-            ProbingTask.QC: self.rlace,
+            ProbingTask.NER: partial(self.rlace, rank=config.rank_subspace),
+            ProbingTask.QC_COARSE: partial(self.rlace, rank=config.rank_subspace),
+            ProbingTask.QC_FINE: self.rlace,
         }
         self.TASKS_INLP = {
             ProbingTask.BM25: lambda x: x,
@@ -67,36 +83,46 @@ class Prober:
         self.config: ProbingConfig = config
         self.model_wrapper = model_wrapper
         self.device = device
-        self.dataset = pd.read_json(DATASET_PATHS[self.config.probing_task], orient="records")
+        if not self.config.probing_task in {ProbingTask.QC_COARSE, ProbingTask.QC_FINE}:
+            self.dataset = pd.read_json(DATASET_PATHS[self.config.probing_task], orient="records")
+        else:
+            self.dataset = pd.read_csv(DATASET_PATHS[self.config.probing_task], sep="\t", header=0)
         self.train, self.test = self._train_test_split()
         layer_str = f"_layer_{self.config.layer}" if type(self.config.layer) == int else ""
         self.normalize_str = f"_normalized_target" if self.config.normalize_target else ""
         self.identification_str = f"{self.config.probing_task}_{self.config.merging_strategy}{layer_str}"
         self.logs_dir = "./logs/results/"
         self.debug = debug
+        self.reconstruction_both = reconstruction_both
 
         if self.config.probing_task in {ProbingTask.COREF, ProbingTask.NER}:
             self.spacy_tokenizer = get_spacy_tokenizer()
 
     def run(self):
-        X, y, X_test, y_test = self.DATA_PREPROCESSING[self.config.probing_task]()
+        self.X_train, self.y_train, self.X_test, self.y_test = self.DATA_PREPROCESSING[self.config.probing_task]()
+        self.num_classes = torch.unique(self.y_train).shape[0]
+
         if self.config.property_removal == PropertyRemoval.RLACE:
             if self.debug:
                 self.projection = torch.rand((EMBEDDING_SIZE, EMBEDDING_SIZE)).to(self.device)
             else:
-                self.projection = self.TASKS_RLACE[self.config.probing_task](X, y, X_test, y_test).to(self.device)
+                self.projection = self.TASKS_RLACE[self.config.probing_task](self.X_train, self.y_train, self.X_test, self.y_test).to(
+                    self.device
+                )
         # Not yet implemented
         elif self.config.property_removal == PropertyRemoval.INLP:
-            self.projection = self.TASKS_INLP[self.config.probing_task](X, y, X_test, y_test).to(self.device)
+            self.projection = self.TASKS_INLP[self.config.probing_task](self.X_train, self.y_train, self.X_test, self.y_test).to(self.device)
         else:
             raise NotImplementedError(f"Property removal algorithm {self.config.property_removal} not implemented.")
 
-    def rlace(self, X: torch.Tensor, y, X_test, y_test, rank: int = 1):
+    def rlace(self, X: torch.Tensor, y, X_test, y_test, rank: int = 1, subspace_ablation: bool = False, out_iters: int = 50000):
+        if self.debug:
+            return torch.rand((EMBEDDING_SIZE, EMBEDDING_SIZE))
         # see if cached projection is available
-        projection_cache_file_str = f"./cache/projections/{self.identification_str}.pt"
-        if Path(projection_cache_file_str).is_file():
-            P = torch.load(projection_cache_file_str)
-            logging.info(f"Loaded cached projection from {projection_cache_file_str}")
+        projection_cache_file = f"./cache/projections/{self.identification_str}_{rank}.pt"
+        if Path(projection_cache_file).is_file() and not subspace_ablation:
+            P = torch.load(projection_cache_file)
+            logging.info(f"Loaded cached projection from {projection_cache_file}")
         else:
             optimizer_class = torch.optim.SGD
             optimizer_params_P = {"lr": 0.005, "weight_decay": 1e-5, "momentum": 0.0}
@@ -109,18 +135,19 @@ class Prober:
                 y_test,
                 rank=rank,
                 device=self.device,
-                out_iters=50000,
+                out_iters=out_iters,
                 optimizer_class=optimizer_class,
                 optimizer_params_P=optimizer_params_P,
                 optimizer_params_predictor=optimizer_params_predictor,
                 epsilon=0.002,
-                batch_size=128,
+                batch_size=256,  # was 128 before 29.04.23
             )
 
             P = torch.from_numpy(output["P"]).float()
-            # cache projection
-            torch.save(P, f"./cache/projections/{self.identification_str}.pt")
-            logging.info(f"Saved projection to {projection_cache_file_str}")
+            if not subspace_ablation:
+                # cache projection
+                torch.save(P, projection_cache_file)
+                logging.info(f"Saved projection to {projection_cache_file}")
 
         return P.to(self.device)
 
@@ -141,11 +168,9 @@ class Prober:
         normalizer.fit(y)
         return normalizer.transform(y)
 
-    def _get_y_single_target(self, split):
+    def _get_y_single_target(self, split, standardize: bool = True):
         y = split["targets"].apply(lambda x: x[0]["label"]).to_numpy().reshape(-1, 1)
-        if self.config.normalize_target:
-            y = self._normalize_y(y)
-        else:
+        if standardize:
             y = self._standardize_y(y)
         return y.ravel()
 
@@ -153,8 +178,11 @@ class Prober:
         y = self._get_y_single_target(split)
         return self._bucketize_y(y, num_buckets)
 
-    def _bucketize_y(self, y, num_buckets: int = NUM_BUCKETS_CLASSIFICATION):
-        boundaries = np.linspace(0, 1, num_buckets)[1:]
+    @staticmethod
+    def _bucketize_y(y, num_buckets: int = NUM_BUCKETS_CLASSIFICATION):
+        y_between = y[np.where((y <= np.mean(y) + 2 * np.std(y)) & (y >= np.mean(y) - 2 * np.std(y)))]
+        boundaries = np.linspace(y_between.min(), y_between.max(), num_buckets)[1:]
+        # boundaries = np.linspace(0, 1, num_buckets)[1:]
         return np.digitize(y, boundaries)
 
     def _y_preprocessing_regression(self, split):
@@ -162,7 +190,7 @@ class Prober:
         return torch.from_numpy(y).to(torch.float32)
 
     def _y_preprocessing_bucketized(self, split, num_buckets: int = NUM_BUCKETS_CLASSIFICATION):
-        targets = self._get_y_single_target(split)
+        targets = self._get_y_single_target(split, standardize=False)
         y = self._bucketize_y(targets, num_buckets)
         return torch.from_numpy(y).to(torch.float32)
 
@@ -178,8 +206,10 @@ class Prober:
         y = np.unique(labels, return_inverse=True)
         return torch.from_numpy(y[1]), spans, entity_texts
 
-    def _y_preprocessing_qc(self, split):
-        pass
+    def _y_preprocessing_qc(self, split, fine_grained: bool = False):
+        labels = split.loc[:, "coarse" if not fine_grained else "fine"].to_numpy()
+        y = np.unique(labels, return_inverse=True)
+        return torch.from_numpy(y[1])
 
     def _data_preprocessing_regression_task(self):
         X = self._get_X_without_intervention("train")
@@ -267,15 +297,42 @@ class Prober:
 
         return X, y, X_test, y_test
 
-    # yet to implement
-    def _data_preprocessing_qc(self):
-        X = self._get_X_without_intervention("train")
-        y = self._y_preprocessing_qc(self.train)
+    def _data_preprocessing_qc(self, fine_grained: bool = False):
+        y = self._y_preprocessing_qc(self.train, fine_grained)
+        y_test = self._y_preprocessing_qc(self.test, fine_grained)
 
-        X_test = self._get_X_without_intervention("test")
-        y_test = self._y_preprocessing_qc(self.test)
+        X = self._get_X_without_intervention_qc(self.train, "train")
+        X_test = self._get_X_without_intervention_qc(self.test, "test")
 
         return X, y, X_test, y_test
+
+    def _get_X_without_intervention_qc(self, split, split_str):
+        X_file_str_orig = f"./cache/probing_task/X_{self.identification_str}_{split_str}.pt"
+        if Path(X_file_str_orig).is_file():
+            X = torch.load(X_file_str_orig)
+            return X
+
+        q_embs = torch.empty((split.shape[0], EMBEDDING_SIZE))
+        for i, row in enumerate(split.iterrows()):
+            q_emb = self.model_wrapper.get_query_embeddings_pyserini([row[1]["question"]], self.config.layer)
+            q_embs[i] = torch.from_numpy(q_emb[0])
+
+        torch.save(q_embs, X_file_str_orig)
+
+        return q_embs
+
+    def _split_preprocessing_qc_with_intervention(self, split, split_str, projection, no_cache: bool = False):
+        q_embs = torch.empty((split.shape[0], EMBEDDING_SIZE))
+        q_embs_altered = torch.empty((split.shape[0], EMBEDDING_SIZE))
+        projection = self.projection if not projection else projection
+        for i, row in enumerate(split.iterrows()):
+            q_emb = self.model_wrapper.get_query_embeddings_pyserini([row[1]["question"]], self.config.layer)
+            q_emb = torch.from_numpy(q_emb[0])
+            q_emb_altered = torch.matmul(q_emb, projection.detach().cpu())
+            q_embs[i] = q_emb
+            q_embs_altered[i] = q_emb_altered
+
+        return q_embs, q_embs_altered
 
     # yet to implement
     def _data_preprocessing_ner(self):
@@ -324,12 +381,12 @@ class Prober:
 
         return p_embs
 
-    def _split_preprocessing_ner_with_intervention(self, split, split_str, projection: Optional[torch.Tensor] = None):
+    def _split_preprocessing_ner_with_intervention(self, split, split_str, projection: Optional[torch.Tensor] = None, no_cache: bool = False):
         X_file_str_orig = f"./cache/probing_task/X_{self.identification_str}_{split_str}.pt"
         X_file_str_altered = f"./cache/probing_task/X_{self.identification_str}_{split_str}_altered.pt"
         projection = self.projection if projection is None else projection
 
-        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file():
+        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file() and not no_cache:
             X_orig = torch.load(X_file_str_orig)
             X_altered = torch.load(X_file_str_altered)
             logging.info(f"Saved X found locally. Restored X from {X_file_str_orig} and {X_file_str_altered}.")
@@ -345,18 +402,21 @@ class Prober:
             p_emb = torch.from_numpy(p_emb)[0]
 
             ner_emb_1st = self._get_ner_embs(sample.text, texts[i * 2], spans[i * 2], p_emb)
-            ner_emb_2nd = self._get_ner_embs(sample.text, texts[i * 2], spans[i * 2], p_emb)
+            ner_emb_2nd = self._get_ner_embs(sample.text, texts[i * 2 + 1], spans[i * 2 + 1], p_emb)
             p_embs[i * 2, :] = ner_emb_1st
             p_embs[i * 2 + 1, :] = ner_emb_2nd
 
-            ner_emb_1st_altered = torch.matmul(ner_emb_1st.unsqueeze(0), projection).squeeze(0)
-            ner_emb_2nd_altered = torch.matmul(ner_emb_2nd.unsqueeze(0), projection).squeeze(0)
+            ner_emb_1st_altered = torch.matmul(ner_emb_1st.unsqueeze(0), projection.detach().cpu()).squeeze(0)
+            ner_emb_2nd_altered = torch.matmul(ner_emb_2nd.unsqueeze(0), projection.detach().cpu()).squeeze(0)
             p_embs_altered[i * 2, :] = ner_emb_1st_altered
             p_embs_altered[i * 2 + 1, :] = ner_emb_2nd_altered
 
-        torch.save(p_embs, X_file_str_orig)
-        torch.save(p_embs_altered, X_file_str_altered)
-        logging.info(f"Documents processed. Embeddings saved to file {X_file_str_orig} and {X_file_str_altered}.")
+        if not no_cache:
+            torch.save(p_embs, X_file_str_orig)
+            torch.save(p_embs_altered, X_file_str_altered)
+            logging.info(f"Documents processed for NER. Embeddings saved to file {X_file_str_orig} and {X_file_str_altered}.")
+        else:
+            logging.info(f"Documents processed for NER. Embeddings not saved to file.")
 
         return p_embs, p_embs_altered
 
@@ -411,12 +471,12 @@ class Prober:
 
         return p_embs, np.array(labels)
 
-    def _split_preprocessing_coref_with_and_without_intervention(self, split, split_str, projection):
+    def _split_preprocessing_coref_with_and_without_intervention(self, split, split_str, projection, no_cache=False):
         X_file_str_orig = f"./cache/probing_task/X_{self.identification_str}_{split_str}.pt"
         X_file_str_altered = f"./cache/probing_task/X_{self.identification_str}_{split_str}_altered.pt"
         projection = self.projection if projection is None else projection
 
-        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file():
+        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file() and not no_cache:
             X_orig = torch.load(X_file_str_orig)
             X_altered = torch.load(X_file_str_altered)
             logging.info(f"Saved X found locally. Restored X from {X_file_str_orig} and {X_file_str_altered}.")
@@ -446,9 +506,12 @@ class Prober:
                 altered_p_emb = torch.matmul(emb.unsqueeze(0), projection.detach().cpu()).squeeze(0)
                 p_embs_altered[i * 2 + j, :] = altered_p_emb
 
-        torch.save(p_embs, X_file_str_orig)
-        torch.save(p_embs_altered, X_file_str_altered)
-        logging.info(f"Documents processed. Embeddings saved to file {X_file_str_orig} and {X_file_str_altered}.")
+        if not no_cache:
+            torch.save(p_embs, X_file_str_orig)
+            torch.save(p_embs_altered, X_file_str_altered)
+            logging.info(f"Documents processed for coref. Embeddings saved to file {X_file_str_orig} and {X_file_str_altered}.")
+        else:
+            logging.info(f"Documents processed for coref. Embeddings not saved to file.")
 
         return p_embs, p_embs_altered
 
@@ -673,7 +736,8 @@ class Prober:
                     indices_non_stopwords = all_indices.difference(indices_of_stopwords)
                     # avg pool over resulting indices
                     p_emb[j, :] = torch.mean(torch.index_select(p_token_embs[j, :], 0, torch.tensor(list(indices_non_stopwords))), dim=0)
-
+            else:
+                raise NotImplementedError("Wrong usage of training data generation function.")
             q_embs[start:end, :] = q_emb  # type: ignore
             p_embs[start:end, :] = p_emb  # type: ignore
 
@@ -682,7 +746,7 @@ class Prober:
 
         return X
 
-    def _get_X_with_and_without_intervention_ti(self, split: str, projection: Optional[torch.Tensor] = None):
+    def _get_X_with_and_without_intervention_ti(self, split: str, projection: Optional[torch.Tensor] = None, no_cache: bool = False):
         logging.info(
             f"Building X for probing task with and without applied intervention for split {split} with {self.config.merging_strategy} merging strategy."
         )
@@ -695,7 +759,7 @@ class Prober:
         else:
             terms = self.terms_test
 
-        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file():
+        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file() and not no_cache:
             X_orig = torch.load(X_file_str_orig)
             X_altered = torch.load(X_file_str_altered)
             logging.info(f"Saved X found locally. Restored X from {X_file_str_orig} and {X_file_str_altered}.")
@@ -729,19 +793,19 @@ class Prober:
                         q_embs_altered[index] = q_emb_altered[j]
                         altered_p_emb = torch.matmul(emb.unsqueeze(0), projection.detach().cpu()).squeeze(0)
                         p_embs_altered[index] = altered_p_emb
-                        # p_embs_altered[index] = torch.einsum(
-                        #     "a,ab->a", emb, projection.detach().cpu()
-                        # )  # TODO: check whether for coref the removal of this solves the problem of our removal not reducing performance
 
             X_orig = self._merge_query_and_passage_embeddings(q_embs, p_embs)
             X_altered = self._merge_query_and_passage_embeddings(q_embs_altered, p_embs_altered)
-            torch.save(X_orig, X_file_str_orig)
-            torch.save(X_altered, X_file_str_altered)
-            logging.info(f"Building finished. Cached results to {X_file_str_orig} and {X_file_str_altered}.")
+            if not no_cache:
+                torch.save(X_orig, X_file_str_orig)
+                torch.save(X_altered, X_file_str_altered)
+                logging.info(f"Building finished. Cached results to {X_file_str_orig} and {X_file_str_altered}.")
+            else:
+                logging.info(f"Building finished. Did not cache results.")
 
         return X_orig, X_altered
 
-    def _get_X_with_and_without_intervention(self, split: str, projection: Optional[torch.Tensor] = None):
+    def _get_X_with_and_without_intervention(self, split: str, projection: Optional[torch.Tensor] = None, no_cache: bool = False):
         logging.info(
             f"Building X for probing task with and without applied intervention for split {split} with {self.config.merging_strategy} merging strategy."
         )
@@ -749,7 +813,7 @@ class Prober:
         X_file_str_altered = f"./cache/probing_task/X_{self.identification_str}_{split}_altered.pt"
         projection = self.projection if projection is None else projection
 
-        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file():
+        if Path(X_file_str_orig).is_file() and Path(X_file_str_altered).is_file() and not no_cache:
             X_orig = torch.load(X_file_str_orig)
             X_altered = torch.load(X_file_str_altered)
             logging.info(f"Saved X found locally. Restored X from {X_file_str_orig} and {X_file_str_altered}.")
@@ -795,6 +859,8 @@ class Prober:
                         altered_p_emb = torch.matmul(p_emb[j, :].unsqueeze(0), projection.detach().cpu()).squeeze(0)
                         p_emb_altered[j, :] = altered_p_emb
                         # p_emb_altered[j, :] = torch.einsum("a,ab->a", p_emb[j, :], projection.detach().cpu())
+                else:
+                    raise NotImplementedError("Wrong usage of training data generation function.")
 
                 q_embs[start:end, :] = q_emb  # type: ignore
                 q_embs_altered[start:end, :] = q_emb_altered  # type: ignore
@@ -803,81 +869,212 @@ class Prober:
 
             X_orig = self._merge_query_and_passage_embeddings(q_embs, p_embs)
             X_altered = self._merge_query_and_passage_embeddings(q_embs_altered, p_embs_altered)
-            torch.save(X_orig, X_file_str_orig)
-            torch.save(X_altered, X_file_str_altered)
-            logging.info(f"Building finished. Cached results to {X_file_str_orig} and {X_file_str_altered}.")
+
+            if not no_cache:
+                torch.save(X_orig, X_file_str_orig)
+                torch.save(X_altered, X_file_str_altered)
+                logging.info(f"Building finished. Cached results to {X_file_str_orig} and {X_file_str_altered}.")
+            else:
+                logging.info(f"Building finished. No caching.")
 
         return X_orig, X_altered
+
+    def train_tenney_mlp(self, probe, X_train, y_train, X_test, y_test) -> float:
+        def shuffle_training_data(X, y):
+            perm = torch.randperm(X.size(0))
+            return X[perm], y[perm]
+
+        # get 10% of training set as validation data
+        val_size = int(X_train.size(0) / 10)
+        perm = torch.randperm(X_train.size(0))
+        idx_val = perm[:val_size]
+        idx_train = perm[val_size:]
+        X_val = X_train[idx_val]
+        y_val = y_train[idx_val]
+        X_train = X_train[idx_train]
+        y_train = y_train[idx_train]
+
+        batches_train = get_batch_amount(X_train.size(0), BATCH_SIZE_PROBING_MODEL)
+        batches_val = get_batch_amount(X_val.size(0), BATCH_SIZE_PROBING_MODEL)
+
+        best_val_loss = np.inf
+        patience = 1
+
+        for epoch in range(EPOCHS):
+            if patience >= 10:
+                logging.info(f"Early stopping. No improvement in 10 epochs over val loss of {best_val_loss}.")
+                break
+            logging.info(f"Starting epoch {epoch}.")
+            probe.train()
+            for i in range(batches_train):
+                start = BATCH_SIZE_PROBING_MODEL * i
+                end = min(BATCH_SIZE_PROBING_MODEL * (i + 1), X_train.size(0))
+
+                pred = probe(X_train[start:end])
+                loss = probe.loss(pred, y_train[start:end])
+                loss.backward()
+                probe.optimizer.step()
+                probe.optimizer.zero_grad()
+            X_train, y_train = shuffle_training_data(X_train, y_train)
+
+            logging.info(f"Training epoch {epoch} done. Validating...")
+            val_losses = []
+            probe.eval()
+            for i in range(batches_val):
+                start = BATCH_SIZE_PROBING_MODEL * i
+                end = min(BATCH_SIZE_PROBING_MODEL * (i + 1), X_val.size(0))
+
+                with torch.no_grad():
+                    pred = probe(X_val[start:end])
+                    val_losses.append(probe.loss(pred, y_val[start:end]))
+
+            val_loss = np.mean(val_losses, axis=0)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience = 1
+            else:
+                patience += 1
+
+            best_val_loss = val_loss if val_loss < best_val_loss else best_val_loss
+
+        # evaluate model after training
+        batches_test = get_batch_amount(X_test.size(0), BATCH_SIZE_PROBING_MODEL)
+        preds = torch.zeros((X_test.size(0)))
+        for i in range(batches_test):
+            start = BATCH_SIZE_PROBING_MODEL * i
+            end = min(BATCH_SIZE_PROBING_MODEL * (i + 1), X_train.size(0))
+
+            with torch.no_grad():
+                pred = probe(X_test[start:end])
+                preds[start:end] = torch.argmax(pred, dim=1)
+
+        test_acc = float(torch.sum(preds == y_test) / y_test.size(0))
+
+        return test_acc
 
     #################################################################################################################################
     ### RECONSTRUCTION OF PROPERTY
 
-    @staticmethod
-    def _fit_and_eval_probe(probe_cls, probe_kwargs, X_train, y_train, X_test, y_test) -> float:
+    def _fit_and_eval_probe(self, probe_cls, probe_kwargs, X_train, y_train, X_test, y_test) -> float:
         probe = probe_cls(**probe_kwargs)
-        probe.fit(X_train, y_train)
-        return probe.score(X_test, y_test)
+        if probe_cls == TenneyMLP:
+            score = self.train_tenney_mlp(probe, X_train, y_train, X_test, y_test)
+        else:
+            probe.fit(X_train, y_train)
+            score = probe.score(X_test, y_test)
+        return score
 
-    def _get_probe_class_and_args_classification(self):
+    def _get_probe_class_and_args_classification(self, seed: int = SEED):
         if self.config.probe_model_type == ProbeModelType.LINEAR:
-            clf_kwargs = {"loss": "log_loss", "n_jobs": -1, "max_iter": 3000, "random_state": SEED, "early_stopping": True}
+            clf_kwargs = {"loss": "log_loss", "n_jobs": -1, "max_iter": 3000, "random_state": seed, "early_stopping": True}
             clf_model = SGDClassifier
         elif self.config.probe_model_type == ProbeModelType.MLP:
-            clf_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 3000, "random_state": SEED, "early_stopping": True}
-            clf_model = MLPClassifier
+            # clf_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 300, "random_state": seed, "early_stopping": True}
+            # clf_model = MLPClassifier
+
+            clf_kwargs = {
+                "input_dim": EMBEDDING_SIZE,
+                "hidden_dim": 256,
+                "output_dim": self.num_classes,
+                "dropout": 0.3,
+                "learning_rate": INITIAL_LR,
+            }
+            clf_model = TenneyMLP
         else:
             raise NotImplementedError(f"Reconstruction of property not implemented for {self.config.probe_model_type} model type.")
         return clf_model, clf_kwargs
 
-    def _get_probe_class_and_args_regression(self):
+    def _get_probe_class_and_args_regression(self, seed: int = SEED):
         if self.config.probe_model_type == ProbeModelType.LINEAR:
-            reg_kwargs = {"random_state": SEED}
+            reg_kwargs = {"random_state": seed, "solver": "svd"}
             reg_model = Ridge
+            # reg_kwargs = {"random_state": seed, "max_iter": 3000, "early_stopping": True}
+            # reg_model = SGDRegressor
         elif self.config.probe_model_type == ProbeModelType.MLP:
-            reg_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 3000, "random_state": SEED, "early_stopping": True}
+            reg_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 300, "random_state": seed, "early_stopping": True}
             reg_model = MLPRegressor
+            # reg_kwargs = {
+            #     "input_dim": EMBEDDING_SIZE,
+            #     "hidden_dim": 256,
+            #     "output_dim": 1,
+            #     "dropout": 0.3,
+            #     "learning_rate": INITIAL_LR,
+            # }
+            # reg_model = TenneyMLP
         else:
             raise NotImplementedError(f"Reconstruction of property not implemented for {self.config.probe_model_type} model type.")
         return reg_model, reg_kwargs
 
-    def _get_probe_classes_and_args(self):
-        if self.config.probe_model_type == ProbeModelType.LINEAR:
-            reg_kwargs = {"random_state": SEED}
-            clf_kwargs = {"loss": "log_loss", "n_jobs": -1, "max_iter": 3000, "random_state": SEED, "early_stopping": True}
-            reg_model = Ridge
-            clf_model = SGDClassifier
-        elif self.config.probe_model_type == ProbeModelType.MLP:
-            reg_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 3000, "random_state": SEED, "early_stopping": True}
-            clf_kwargs = {"hidden_layer_sizes": (100,), "max_iter": 3000, "random_state": SEED, "early_stopping": True}
-            reg_model = MLPRegressor
-            clf_model = MLPClassifier
-        else:
-            raise NotImplementedError(f"Reconstruction of property not implemented for {self.config.probe_model_type} model type.")
+    def _get_probe_classes_and_args(self, seed: int = SEED):
+        reg_model, reg_kwargs = self._get_probe_class_and_args_regression(seed)
+        clf_model, clf_kwargs = self._get_probe_class_and_args_classification(seed)
         return reg_model, reg_kwargs, clf_model, clf_kwargs
 
-    def _get_X_for_probes(self, rank: int = 1, projection: Optional[torch.Tensor] = None):
+    def _get_X_for_probes(self, rank: int = 1, projection: Optional[torch.Tensor] = None, no_cache: bool = False):
         if self.config.probing_task in {ProbingTask.TI, ProbingTask.TI_BUCKETIZED}:
-            X_orig_train, X_altered_train = self._get_X_with_and_without_intervention_ti("train", projection)
-            X_orig_test, X_altered_test = self._get_X_with_and_without_intervention_ti("test", projection)
+            X_orig_train, X_altered_train = self._get_X_with_and_without_intervention_ti("train", projection, no_cache)
+            X_orig_test, X_altered_test = self._get_X_with_and_without_intervention_ti("test", projection, no_cache)
         elif self.config.probing_task == ProbingTask.COREF:
-            X_orig_train, X_altered_train = self._split_preprocessing_coref_with_and_without_intervention(self.train, "train", projection)
-            X_orig_test, X_altered_test = self._split_preprocessing_coref_with_and_without_intervention(self.test, "test", projection)
+            X_orig_train, X_altered_train = self._split_preprocessing_coref_with_and_without_intervention(
+                self.train, "train", projection, no_cache
+            )
+            X_orig_test, X_altered_test = self._split_preprocessing_coref_with_and_without_intervention(
+                self.test, "test", projection, no_cache
+            )
         elif self.config.probing_task == ProbingTask.NER:
-            X_orig_train, X_altered_train = self._split_preprocessing_ner_with_intervention(self.train, "train", projection)
-            X_orig_test, X_altered_test = self._split_preprocessing_ner_with_intervention(self.test, "test", projection)
+            X_orig_train, X_altered_train = self._split_preprocessing_ner_with_intervention(self.train, "train", projection, no_cache)
+            X_orig_test, X_altered_test = self._split_preprocessing_ner_with_intervention(self.test, "test", projection, no_cache)
+        elif self.config.probing_task in {ProbingTask.QC_COARSE, ProbingTask.QC_FINE}:
+            X_orig_train, X_altered_train = self._split_preprocessing_qc_with_intervention(self.train, "train", projection, no_cache)
+            X_orig_test, X_altered_test = self._split_preprocessing_qc_with_intervention(self.test, "test", projection, no_cache)
         else:
-            X_orig_train, X_altered_train = self._get_X_with_and_without_intervention("train", projection)
-            X_orig_test, X_altered_test = self._get_X_with_and_without_intervention("test", projection)
+            X_orig_train, X_altered_train = self._get_X_with_and_without_intervention("train", projection, no_cache)
+            X_orig_test, X_altered_test = self._get_X_with_and_without_intervention("test", projection, no_cache)
 
         # creating feature data for control over information ablation
-        rand_dir_projection = torch.from_numpy(create_rand_dir_projection(EMBEDDING_SIZE, rank)).to(torch.float32)
+        rand_dir_projection = torch.from_numpy(create_rand_dir_from_orth_basis_projection(X_orig_train, rank)).to(torch.float32)
         X_control_train = torch.einsum("bc,cd->bd", X_orig_train, rand_dir_projection)
         X_control_test = torch.einsum("bc,cd->bd", X_orig_test, rand_dir_projection)
 
         return X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test
 
+    def _get_X_for_probes_subspace_ablation(self, rank, projection):
+        X_file_str_orig_train = f"./cache/probing_task/X_{self.identification_str}_train.pt"
+        X_file_str_orig_test = f"./cache/probing_task/X_{self.identification_str}_test.pt"
+        if Path(X_file_str_orig_train).is_file() and Path(X_file_str_orig_test).is_file():
+            X_orig_train = torch.load(X_file_str_orig_train)
+            X_orig_test = torch.load(X_file_str_orig_test)
+        else:
+            raise Exception("X_orig_train and X_orig_test not found. Please run without subspace ablation first.")
+
+        X_altered_train = torch.einsum("bc,cd->bd", X_orig_train, projection.detach().cpu())
+        X_altered_test = torch.einsum("bc,cd->bd", X_orig_test, projection.detach().cpu())
+
+        # creating feature data for control over information ablation
+        rand_dir_projection = torch.from_numpy(create_rand_dir_from_orth_basis_projection(X_orig_train, rank)).to(torch.float32)
+        X_control_train = torch.einsum("bc,cd->bd", X_orig_train, rand_dir_projection)
+        X_control_test = torch.einsum("bc,cd->bd", X_orig_test, rand_dir_projection)
+
+        return X_altered_train, X_control_train, X_altered_test, X_control_test
+
+    def _get_X_for_probes_subspace_ablation_control_only(self, rank):
+        X_file_str_orig_train = f"./cache/probing_task/X_{self.identification_str}_train.pt"
+        X_file_str_orig_test = f"./cache/probing_task/X_{self.identification_str}_test.pt"
+        if Path(X_file_str_orig_train).is_file() and Path(X_file_str_orig_test).is_file():
+            X_orig_train = torch.load(X_file_str_orig_train)
+            X_orig_test = torch.load(X_file_str_orig_test)
+        else:
+            raise Exception("X_orig_train and X_orig_test not found. Please run without subspace ablation first.")
+
+        # creating feature data for control over information ablation
+        rand_dir_projection = torch.from_numpy(create_rand_dir_from_orth_basis_projection(X_orig_train, rank)).to(torch.float32)
+        X_control_train = torch.einsum("bc,cd->bd", X_orig_train, rand_dir_projection)
+        X_control_test = torch.einsum("bc,cd->bd", X_orig_test, rand_dir_projection)
+
+        return X_control_train, X_control_test
+
     def _random_init_X_train_test(self):
-        if self.config.probing_task == ProbingTask.COREF:
+        if self.config.probing_task in {ProbingTask.COREF, ProbingTask.NER}:
             train_len = len(self.train) * 2
             test_len = len(self.test) * 2
         else:
@@ -916,6 +1113,15 @@ class Prober:
         if self.config.probing_task == ProbingTask.COREF:
             y_train = np.array([1, 0] * len(self.train))
             y_test = np.array([1, 0] * len(self.test))
+        elif self.config.probing_task == ProbingTask.NER:
+            y_train, _, __ = self._y_preprocessing_ner(self.train)
+            y_test, _, __ = self._y_preprocessing_ner(self.test)
+        elif self.config.probing_task == ProbingTask.QC_COARSE:
+            y_train = self._y_preprocessing_qc(self.train)
+            y_test = self._y_preprocessing_qc(self.test)
+        elif self.config.probing_task == ProbingTask.QC_FINE:
+            y_train = self._y_preprocessing_qc(self.train, True)
+            y_test = self._y_preprocessing_qc(self.test, True)
         else:
             y_train = self._get_y_bucketized(self.train)
             y_test = self._get_y_bucketized(self.test)
@@ -932,175 +1138,234 @@ class Prober:
         accs = [self._classifcation_baseline(MLPClassifier, clf_kwargs) for _ in range(PROBE_MODEL_RUNS)]
         self._cache_baseline(f"{self.config.probing_task}_classification_mlp{self.normalize_str}", float(np.average(accs)))
 
-    def reconstruction(self):
-        reconstruction: dict[ProbingTask, Callable] = {
-            ProbingTask.BM25: self.reconstruct_property_regression,
-            ProbingTask.SEM: self.reconstruct_property_regression,
-            ProbingTask.AVG_TI: self.reconstruct_property_regression,
-            ProbingTask.TI: self.reconstruct_property_regression,
-            ProbingTask.BM25_BUCKETIZED: self.reconstruct_property_classification,
-            ProbingTask.SEM_BUCKETIZED: self.reconstruct_property_classification,
-            ProbingTask.AVG_TI_BUCKETIZED: self.reconstruct_property_classification,
-            ProbingTask.TI_BUCKETIZED: self.reconstruct_property_classification,
-            ProbingTask.COREF: self.reconstruct_property_classification,
-            ProbingTask.NER: self.reconstruct_property_classification,
-            ProbingTask.QC: self.reconstruct_property_classification,
-        }
-        reconstruction[self.config.probing_task]()
+    def reconstruction(self, multiple_runs: bool = False) -> None:
+        if self.reconstruction_both:
+            reconstruction: dict[ProbingTask, Callable] = {
+                ProbingTask.BM25: partial(self.reconstruct_property_both, multiple_runs=multiple_runs),
+                ProbingTask.SEM: partial(self.reconstruct_property_both, multiple_runs=multiple_runs),
+                ProbingTask.AVG_TI: partial(self.reconstruct_property_both, multiple_runs=multiple_runs),
+                ProbingTask.TI: partial(self.reconstruct_property_both, multiple_runs=multiple_runs),
+            }
+            reconstruction[self.config.probing_task]()
+        else:
+            reconstruction: dict[ProbingTask, Callable] = {
+                ProbingTask.BM25: partial(self.reconstruct_property_regression, multiple_runs=multiple_runs),
+                ProbingTask.SEM: partial(self.reconstruct_property_regression, multiple_runs=multiple_runs),
+                ProbingTask.AVG_TI: partial(self.reconstruct_property_regression, multiple_runs=multiple_runs),
+                ProbingTask.TI: partial(self.reconstruct_property_regression, multiple_runs=multiple_runs),
+                ProbingTask.BM25_BUCKETIZED: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.SEM_BUCKETIZED: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.AVG_TI_BUCKETIZED: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.TI_BUCKETIZED: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.COREF: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.NER: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.QC_COARSE: partial(self.reconstruct_property_classification, multiple_runs=multiple_runs),
+                ProbingTask.QC_FINE: self.reconstruct_property_classification,
+            }
+            reconstruction[self.config.probing_task]()
 
-    def reconstruct_property(self):
+    def reconstruct_property_both(self, multiple_runs: bool = False) -> None:
         """Attempt to predict property from embeddings, which should not contain the property anymore."""
         assert isinstance(self.projection, torch.Tensor), "Probing task should have run before attempting to reconstruct property!"
 
         logging.info("Calculating baseline performances for reconstruction from random encodings.")
-        self._classification_baseline_linear()
-        self._classification_baseline_mlp()
-        self._regressor_baseline_linear()
-        self._regressor_baseline_mlp()
+        # self._classification_baseline_linear()
+        # self._classification_baseline_mlp()
+        # self._regressor_baseline_linear()
+        # self._regressor_baseline_mlp()
 
-        logging.info("Attempting to reconstruct property from original, probed and control (over information) encodings.")
-        reg_model, reg_kwargs, clf_model, clf_kwargs = self._get_probe_classes_and_args()
+        seed = SEED
+        nr_of_runs = 1
+        if multiple_runs:
+            nr_of_runs = RERUNS
 
-        X_orig_train, X_altered_train = self._get_X_with_and_without_intervention("train")
-        y_train = self._get_y_single_target(self.train)
-        y_train_bucketized = self._get_y_bucketized(self.train, num_buckets=10)
+        for i in range(nr_of_runs):
+            reg_model, reg_kwargs, clf_model, clf_kwargs = self._get_probe_classes_and_args(seed)
+            seed += 1
 
-        X_orig_test, X_altered_test = self._get_X_with_and_without_intervention("test")
-        y_test = self._get_y_single_target(self.test)
-        y_test_bucketized = self._get_y_bucketized(self.test, num_buckets=10)
+            logging.info(f"Attempting recosntruction of property from original, probed and control encodings. {i + 1}/{nr_of_runs}")
 
-        # creating feature data for control over information ablation
-        rand_dir_projection = torch.from_numpy(create_rand_dir_projection(EMBEDDING_SIZE, 1)).to(torch.float32)
-        X_control_train = torch.einsum("bc,cd->bd", X_orig_train, rand_dir_projection)
-        X_control_test = torch.einsum("bc,cd->bd", X_orig_test, rand_dir_projection)
-
-        logging.info(f"Fitting and evaluating regressors and classifiers.")
-        r2_orig = self._fit_and_eval_probe(reg_model, reg_kwargs, X_orig_train, y_train, X_orig_test, y_test)
-        r2_probed = self._fit_and_eval_probe(reg_model, reg_kwargs, X_altered_train, y_train, X_altered_test, y_test)
-        r2_control = self._fit_and_eval_probe(reg_model, reg_kwargs, X_control_train, y_train, X_control_test, y_test)
-
-        acc_orig = self._fit_and_eval_probe(clf_model, clf_kwargs, X_orig_train, y_train_bucketized, X_orig_test, y_test_bucketized)
-        acc_probed = self._fit_and_eval_probe(clf_model, clf_kwargs, X_altered_train, y_train_bucketized, X_altered_test, y_test_bucketized)
-        acc_control = self._fit_and_eval_probe(clf_model, clf_kwargs, X_control_train, y_train_bucketized, X_control_test, y_test_bucketized)
-
-        maj_acc_train = self._get_majority_acc(y_train_bucketized)
-        # maj_acc_test = self._get_majority_acc(y_test_bucketized)
-
-        file_str = (
-            self.logs_dir
-            + "ablation/"
-            + str(self.config.probing_task)
-            + "/"
-            + self.identification_str
-            + self.normalize_str
-            + "_reconstruction.log"
-        )
-        with open(file_str, "a+") as f:
-            f.write(f"r2_orig\tr2_probed\tr2_control\tr2_diff\tacc_orig\tacc_probed\tacc_control\tacc_diff\tmaj_acc\tmodel_type\n")
-            f.write(
-                f"{r2_orig:.3f}\t{r2_probed:.3f}\t{r2_control:.3f}\t{(r2_probed - r2_orig):.3f}\t"
-                + f"{acc_orig:.3f}\t{acc_probed:.3f}\t{acc_control:.3f}\t{(acc_orig - acc_probed):.3f}\t"
-                + f"{maj_acc_train:.3f}\t{self.config.probe_model_type}\n"
+            X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test = self._get_X_for_probes(
+                no_cache=multiple_runs
             )
-        logging.info(f"Saved results to {file_str}")
+            if self.config.probing_task == ProbingTask.TI:
+                y_train, _ = self._trim_ti_dataset_to_get_targets(self.train)
+                y_test, _ = self._trim_ti_dataset_to_get_targets(self.test)
+            else:
+                y_train = self._get_y_single_target(self.train)
+                y_train_bucketized = self._get_y_single_target(self.train, standardize=False)
+                y_test = self._get_y_single_target(self.test)
+                y_test_bucketized = self._get_y_single_target(self.test, standardize=False)
 
-    def reconstruct_property_classification(self):
-        if self.config.probe_model_type == ProbeModelType.LINEAR:
-            self._classification_baseline_linear()
-        elif self.config.probe_model_type == ProbeModelType.MLP:
-            self._classification_baseline_mlp()
+            y_train_bucketized = self._bucketize_y(y_train_bucketized)
+            y_test_bucketized = self._bucketize_y(y_test_bucketized)
 
-        clf_model, clf_kwargs = self._get_probe_class_and_args_classification()
+            logging.info(f"Fitting and evaluating regressors and classifiers.")
+            r2_orig = self._fit_and_eval_probe(reg_model, reg_kwargs, X_orig_train, y_train, X_orig_test, y_test)
+            r2_probed = self._fit_and_eval_probe(reg_model, reg_kwargs, X_altered_train, y_train, X_altered_test, y_test)
+            r2_control = self._fit_and_eval_probe(reg_model, reg_kwargs, X_control_train, y_train, X_control_test, y_test)
 
-        X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test = self._get_X_for_probes()
-        if self.config.probing_task == ProbingTask.TI_BUCKETIZED:
-            y_train, _ = self._trim_ti_dataset_to_get_targets(self.train)
-            y_train = self._bucketize_y(y_train)
-            y_test, _ = self._trim_ti_dataset_to_get_targets(self.test)
-            y_test = self._bucketize_y(y_test)
-        elif self.config.probing_task == ProbingTask.COREF:
-            y_train = np.array([1, 0] * len(self.train))
-            y_test = np.array([1, 0] * len(self.test))
-        elif self.config.probing_task == ProbingTask.NER:
-            y_train, spans_train, texts_train = self._y_preprocessing_ner(self.train)
-            y_test, spans_test, texts_test = self._y_preprocessing_ner(self.test)
-        else:
-            y_train = self._get_y_bucketized(self.train)
-            y_test = self._get_y_bucketized(self.test)
+            acc_orig = self._fit_and_eval_probe(clf_model, clf_kwargs, X_orig_train, y_train_bucketized, X_orig_test, y_test_bucketized)
+            acc_probed = self._fit_and_eval_probe(
+                clf_model, clf_kwargs, X_altered_train, y_train_bucketized, X_altered_test, y_test_bucketized
+            )
+            acc_control = self._fit_and_eval_probe(
+                clf_model, clf_kwargs, X_control_train, y_train_bucketized, X_control_test, y_test_bucketized
+            )
 
-        acc_orig = self._fit_and_eval_probe(clf_model, clf_kwargs, X_orig_train, y_train, X_orig_test, y_test)
-        acc_probed = self._fit_and_eval_probe(clf_model, clf_kwargs, X_altered_train, y_train, X_altered_test, y_test)
-        acc_control = self._fit_and_eval_probe(clf_model, clf_kwargs, X_control_train, y_train, X_control_test, y_test)
+            # maj_acc_train = self._get_majority_acc(y_train_bucketized)
+            # maj_acc_test = self._get_majority_acc(y_test_bucketized)
 
-        file_str = (
-            self.logs_dir
-            + "ablation/"
-            + str(self.config.probing_task)
-            + "/"
-            + self.identification_str
-            + self.normalize_str
-            + "_reconstruction_clf.log"
-        )
-        with open(file_str, "a+") as f:
-            f.write("acc_orig\tacc_probed\tacc_control\tmodel_type\n")
-            f.write(f"{acc_orig:.3f}\t{acc_probed:.3f}\t{acc_control:.3f}\t{self.config.probe_model_type}\n")
+            file_str = (
+                self.logs_dir
+                + "ablation/"
+                + str(self.config.probing_task)
+                + "/"
+                + self.identification_str
+                + self.normalize_str
+                + "_reconstruction_both.log"
+            )
+            with open(file_str, "a+") as f:
+                f.write(f"r2_orig\tr2_probed\tr2_control\tr2_diff\tacc_orig\tacc_probed\tacc_control\tacc_diff\tmaj_acc\tmodel_type\n")
+                f.write(
+                    f"{r2_orig:.3f}\t{r2_probed:.3f}\t{r2_control:.3f}\t{(r2_probed - r2_orig):.3f}\t"
+                    + f"{acc_orig:.3f}\t{acc_probed:.3f}\t{acc_control:.3f}\t{(acc_orig - acc_probed):.3f}\t"
+                    + f"{0}\t{self.config.probe_model_type}\n"
+                )
+            logging.info(f"Saved results to {file_str}")
 
-    def reconstruct_property_regression(self):
+    def reconstruct_property_classification(self, multiple_runs=False):
+        # if self.config.probe_model_type == ProbeModelType.LINEAR:
+        #     self._classification_baseline_linear()
+        # elif self.config.probe_model_type == ProbeModelType.MLP:
+        #     self._classification_baseline_mlp()
+
+        seed = SEED
+        nr_of_runs = 1
+        if multiple_runs:
+            nr_of_runs = RERUNS
+
+        for i in range(nr_of_runs):
+            clf_model, clf_kwargs = self._get_probe_class_and_args_classification(seed)
+            seed += 1
+
+            X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test = self._get_X_for_probes(
+                rank=self.config.rank_subspace, no_cache=multiple_runs
+            )
+            if self.config.probing_task == ProbingTask.TI_BUCKETIZED:
+                y_train, _ = self._trim_ti_dataset_to_get_targets(self.train)
+                y_train = self._bucketize_y(y_train)
+                y_test, _ = self._trim_ti_dataset_to_get_targets(self.test)
+                y_test = self._bucketize_y(y_test)
+            elif self.config.probing_task == ProbingTask.COREF:
+                y_train = np.array([1, 0] * len(self.train))
+                y_test = np.array([1, 0] * len(self.test))
+            elif self.config.probing_task == ProbingTask.NER:
+                y_train, spans_train, texts_train = self._y_preprocessing_ner(self.train)
+                y_test, spans_test, texts_test = self._y_preprocessing_ner(self.test)
+            elif self.config.probing_task == ProbingTask.QC_COARSE:
+                y_train = self._y_preprocessing_qc(self.train)
+                y_test = self._y_preprocessing_qc(self.test)
+            else:
+                y_train = self._get_y_bucketized(self.train)
+                y_test = self._get_y_bucketized(self.test)
+
+            acc_orig = self._fit_and_eval_probe(clf_model, clf_kwargs, X_orig_train, y_train, X_orig_test, y_test)
+            acc_probed = self._fit_and_eval_probe(clf_model, clf_kwargs, X_altered_train, y_train, X_altered_test, y_test)
+            acc_control = self._fit_and_eval_probe(clf_model, clf_kwargs, X_control_train, y_train, X_control_test, y_test)
+
+            file_str = (
+                self.logs_dir
+                + "ablation/"
+                + str(self.config.probing_task)
+                + "/"
+                + self.identification_str
+                + self.normalize_str
+                + "_reconstruction_clf.log"
+            )
+            with open(file_str, "a+") as f:
+                f.write("acc_orig\tacc_probed\tacc_control\tmodel_type\n")
+                f.write(f"{acc_orig:.3f}\t{acc_probed:.3f}\t{acc_control:.3f}\t{self.config.probe_model_type}\n")
+
+    def reconstruct_property_regression(self, multiple_runs=False):
         if self.config.probe_model_type == ProbeModelType.LINEAR:
             self._regressor_baseline_linear()
         elif self.config.probe_model_type == ProbeModelType.MLP:
             self._regressor_baseline_mlp()
 
-        reg_model, reg_kwargs = self._get_probe_class_and_args_regression()
+        seed = SEED
+        nr_of_runs = 1
+        if multiple_runs:
+            nr_of_runs = RERUNS
 
-        X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test = self._get_X_for_probes()
-        if self.config.probing_task == ProbingTask.TI:
-            y_train, _ = self._trim_ti_dataset_to_get_targets(self.train)
-            y_test, _ = self._trim_ti_dataset_to_get_targets(self.test)
-        else:
-            y_train = self._get_y_single_target(self.train)
-            y_test = self._get_y_single_target(self.test)
+        for i in range(nr_of_runs):
+            reg_model, reg_kwargs = self._get_probe_class_and_args_regression(seed)
+            seed += 1
 
-        r2_orig = self._fit_and_eval_probe(reg_model, reg_kwargs, X_orig_train, y_train, X_orig_test, y_test)
-        r2_probed = self._fit_and_eval_probe(reg_model, reg_kwargs, X_altered_train, y_train, X_altered_test, y_test)
-        r2_control = self._fit_and_eval_probe(reg_model, reg_kwargs, X_control_train, y_train, X_control_test, y_test)
+            X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test = self._get_X_for_probes(
+                no_cache=False  # multiple_runs before test if sgd regressor shoudl be used
+            )
+            if self.config.probing_task == ProbingTask.TI:
+                y_train, _ = self._trim_ti_dataset_to_get_targets(self.train)
+                y_test, _ = self._trim_ti_dataset_to_get_targets(self.test)
+            else:
+                y_train = self._get_y_single_target(self.train)
+                y_test = self._get_y_single_target(self.test)
 
-        file_str = (
-            self.logs_dir
-            + "ablation/"
-            + str(self.config.probing_task)
-            + "/"
-            + self.identification_str
-            + self.normalize_str
-            + "_reconstruction_reg.log"
-        )
-        with open(file_str, "a+") as f:
-            f.write("r2_orig\tr2_probed\tr2_control\tmodel_type\n")
-            f.write(f"{r2_orig:.3f}\t{r2_probed:.3f}\t{r2_control:.3f}\t{self.config.probe_model_type}\n")
+            r2_orig = self._fit_and_eval_probe(reg_model, reg_kwargs, X_orig_train, y_train, X_orig_test, y_test)
+            r2_probed = self._fit_and_eval_probe(reg_model, reg_kwargs, X_altered_train, y_train, X_altered_test, y_test)
+            r2_control = self._fit_and_eval_probe(reg_model, reg_kwargs, X_control_train, y_train, X_control_test, y_test)
 
-    def determine_subspace_rank(self):
+            file_str = (
+                self.logs_dir
+                + "ablation/"
+                + str(self.config.probing_task)
+                + "/"
+                + self.identification_str
+                + self.normalize_str
+                + "_reconstruction_reg.log"
+            )
+            with open(file_str, "a+") as f:
+                f.write("r2_orig\tr2_probed\tr2_control\tmodel_type\n")
+                f.write(f"{r2_orig:.3f}\t{r2_probed:.3f}\t{r2_control:.3f}\t{self.config.probe_model_type}\n")
+
+    def determine_subspace_rank(self, control_only: bool = False):
         X, y, X_test, y_test = self.DATA_PREPROCESSING[self.config.probing_task]()
         accs_probed = []
         accs_control = []
-        for i in range(SUBSPACE_RANK):
+        for i in list(np.logspace(0, 2.8, num=10, dtype=int)):  # [1, 2, 4, 8, 17, 35, 73, 150, 308, 630]
             # Test removal of multiple ranks for which layer? all layers for now
-            projection = self.rlace(X, y, X_test, y_test, rank=i + 1)
-
             clf_model, clf_kwargs = self._get_probe_class_and_args_classification()
 
-            X_orig_train, X_altered_train, X_control_train, X_orig_test, X_altered_test, X_control_test = self._get_X_for_probes(
-                projection=projection
-            )
-            y_train = self._get_y_bucketized(self.train)
-            y_test = self._get_y_bucketized(self.test)
+            if not control_only:
+                projection = self.rlace(X, y, X_test, y_test, rank=i, subspace_ablation=True, out_iters=75000)
 
-            accs_probed.append(self._fit_and_eval_probe(clf_model, clf_kwargs, X_altered_train, y_train, X_altered_test, y_test))
+                X_altered_train, X_control_train, X_altered_test, X_control_test = self._get_X_for_probes_subspace_ablation(
+                    rank=i, projection=projection
+                )
+
+            else:
+                X_control_train, X_control_test = self._get_X_for_probes_subspace_ablation_control_only(rank=i)
+
+            if self.config.probing_task == ProbingTask.NER:
+                y_train, _, __ = self._y_preprocessing_ner(self.train)
+                y_test, _, __ = self._y_preprocessing_ner(self.test)
+            elif self.config.probing_task == ProbingTask.QC_COARSE:
+                y_train = self._y_preprocessing_qc(self.train, False)
+                y_test = self._y_preprocessing_qc(self.test, False)
+            else:
+                y_train = self._get_y_bucketized(self.train)
+                y_test = self._get_y_bucketized(self.test)
+
+            if not control_only:
+                accs_probed.append(self._fit_and_eval_probe(clf_model, clf_kwargs, X_altered_train, y_train, X_altered_test, y_test))
             accs_control.append(self._fit_and_eval_probe(clf_model, clf_kwargs, X_control_train, y_train, X_control_test, y_test))
 
-        file_str = self.logs_dir + "ablation/" + str(self.config.probing_task) + "/" + self.identification_str + "_subspace_rank.log"
+        file_str = self.logs_dir + "ablation/subspace/" + self.identification_str + "_subspace_rank.log"
         with open(file_str, "a+") as f:
             tsv_out = csv.writer(f, delimiter="\t")
-            tsv_out.writerow(accs_probed + [self.config.layer, "probed", self.config.probe_model_type])
+            if not control_only:
+                tsv_out.writerow(accs_probed + [self.config.layer, "probed", self.config.probe_model_type])
             tsv_out.writerow(accs_control + [self.config.layer, "control", self.config.probe_model_type])
 
 
