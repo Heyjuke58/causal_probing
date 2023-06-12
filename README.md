@@ -4,6 +4,7 @@ This project contains the code of my [masters thesis](Deconstructing_Retrieval_A
 
 Results of causally probing TCT-ColBERT
 ![](plots/all_behaviour_heatmap_ndcg_10_shortened.png)
+Retrieval performance on the $43$ TREC test queries shown per task and intervention layer. The rank of the eliminated subspace is chosen as $k=8$ for NER, $k=4$ for QC, and $k=1$ for all other tasks.
 
 ## Project Setup
 
