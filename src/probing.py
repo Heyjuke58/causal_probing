@@ -564,18 +564,21 @@ class Prober:
         Merge query and passage embeddings to construct feature data for training the linear probe.
         Probably can be removed since average seems to be the strategy to go with.
         """
-        if self.config.merging_strategy == MergingStrategy.CONCAT:
-            # concat embeddings to get a tensor of len(query) x EMBEDDING_SIZE * 2
-            X = torch.cat((q_embs, p_embs), 1)
-        elif self.config.merging_strategy == MergingStrategy.MULTIPLY_ELEMENTWISE:
-            # multiply embeddings elementwise
-            X = q_embs * p_embs
-        elif self.config.merging_strategy == MergingStrategy.AVERAGE:
-            # take average over each embedding dimension
-            embs = torch.cat((q_embs.unsqueeze(0), p_embs.unsqueeze(0)), 0)
-            X = torch.mean(embs, 0)
-        else:
-            raise NotImplementedError(f"Merging with strategy {self.config.merging_strategy} not supported.")
+        embs = torch.cat((q_embs.unsqueeze(0), p_embs.unsqueeze(0)), 0)
+        X = torch.mean(embs, 0)
+        # legacy code
+        # if self.config.merging_strategy == MergingStrategy.CONCAT:
+        #     # concat embeddings to get a tensor of len(query) x EMBEDDING_SIZE * 2
+        #     X = torch.cat((q_embs, p_embs), 1)
+        # elif self.config.merging_strategy == MergingStrategy.MULTIPLY_ELEMENTWISE:
+        #     # multiply embeddings elementwise
+        #     X = q_embs * p_embs
+        # elif self.config.merging_strategy == MergingStrategy.AVERAGE:
+        #     # take average over each embedding dimension
+        #     embs = torch.cat((q_embs.unsqueeze(0), p_embs.unsqueeze(0)), 0)
+        #     X = torch.mean(embs, 0)
+        # else:
+        #     raise NotImplementedError(f"Merging with strategy {self.config.merging_strategy} not supported.")
 
         return X
 
@@ -727,9 +730,7 @@ class Prober:
         return X
 
     def _get_X_with_and_without_intervention_ti(self, split: str, projection: Optional[torch.Tensor] = None, no_cache: bool = False):
-        logging.info(
-            f"Building X for probing task with and without applied intervention for split {split} with {self.config.merging_strategy} merging strategy."
-        )
+        logging.info(f"Building X for probing task with and without applied intervention for split {split}.")
         X_file_str_orig = f"./cache/probing_task/X_{self.identification_str}_{split}.pt"
         X_file_str_altered = f"./cache/probing_task/X_{self.identification_str}_{split}_altered.pt"
         projection = self.projection if projection is None else projection
@@ -786,9 +787,7 @@ class Prober:
         return X_orig, X_altered
 
     def _get_X_with_and_without_intervention(self, split: str, projection: Optional[torch.Tensor] = None, no_cache: bool = False):
-        logging.info(
-            f"Building X for probing task with and without applied intervention for split {split} with {self.config.merging_strategy} merging strategy."
-        )
+        logging.info(f"Building X for probing task with and without applied intervention for split {split}.")
         X_file_str_orig = f"./cache/probing_task/X_{self.identification_str}_{split}.pt"
         X_file_str_altered = f"./cache/probing_task/X_{self.identification_str}_{split}_altered.pt"
         projection = self.projection if projection is None else projection

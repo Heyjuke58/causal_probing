@@ -7,7 +7,6 @@ def parse_arguments_intervention():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", dest="debug", action="store_true")
     parser.add_argument("--device_cpu", dest="device_cpu", action="store_true")
-    parser.add_argument("--alter_query_embedding", dest="alter_query_embedding", action="store_true")
     parser.add_argument("--reconstruction_both", dest="reconstruction_both", action="store_true")
     parser.add_argument("--control_only", dest="control_only", action="store_true")
     parser.add_argument("--multiple_runs", dest="multiple_runs", action="store_true")
